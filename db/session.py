@@ -1,9 +1,10 @@
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase
 from core.config import settings
+from sqlalchemy.pool import NullPool
 
 # Crear el motor asíncrono
-engine = create_async_engine(settings.DATABASE_URL, echo=True)
+engine = create_async_engine(settings.DATABASE_URL, echo=True, poolclass=NullPool)
 
 # Crear la fábrica de sesiones
 AsyncSessionLocal = async_sessionmaker(
