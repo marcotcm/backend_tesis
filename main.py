@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from api.v1.api import api_router
+import uvicorn
 
 app = FastAPI(
     title="Sistema RCM Backend API",
@@ -24,5 +25,4 @@ def health_check():
     return {"status": "online", "message": "API RCM operativa"}
 
 if __name__ == "__main__":
-     import uvicorn
      uvicorn.run(app, host="0.0.0.0", port=8000)
