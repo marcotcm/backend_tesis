@@ -25,10 +25,7 @@ app.include_router(api_router, prefix="/api/v1")
 def health_check():
     return {"status": "online", "message": "API RCM operativa"}
 
-def custom_openapi():
-    # Si ya se generó el esquema, lo devuelve para no procesar de más
-    if app.openapi_schema:
-        return app.openapi_schema
+def c
     
     # Generamos el esquema base con tus rutas reales de FastAPI
     openapi_schema = get_openapi(
