@@ -1,100 +1,81 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from api.v1.api import api_router
-import uvicorn
-from fastapi.openapi.utils import get_openapi
+"""
+Punto de Entrada Principal de la Aplicación FastAPI (RCM Confiabilidad Industrial).
 
+Configura el ciclo de vida del servidor, middlewares de CORS, 
+manejadores globales de excepciones e incluye el enrutador central de la API.
+"""
+
+import logging
+from fastapi import FastAPI, Request, status
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.exc import SQLAlchemyError
+
+from models.user import User  # Registro explícito del modelo en el metadata de SQLAlchemy
+from api.v1.api import api_router
+from core.config import settings
+
+# 1. Configuración de Logging del Sistema
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("rcm_backend")
+
+# 2. Inicialización de la Aplicación FastAPI
 app = FastAPI(
-    title="Sistema RCM Backend API",
-    description="Backend para gestión RCM de activos críticos",
-    version="1.0.0"
+    title=settings.PROJECT_NAME,
+    description="Backend RCM para gestión de confiabilidad operativa industrial y mantenimiento adaptativo.",
+    version=settings.VERSION,
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
-# Manejador global de excepciones para mantener la API profesional
+# 3. Configuración de Middleware CORS (Habilita la integración con Frontend Web y Móvil)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configurar con dominios específicos en entornos de producción
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 4. Manejadores Globales de Excepciones
+
+@app.exception_handler(SQLAlchemyError)
+async def database_exception_handler(request: Request, exc: SQLAlchemyError):
+    """Captura y loguea fallos a nivel de base de datos sin exponer detalles de infraestructura al cliente."""
+    logger.error(f"Error de base de datos en {request.url.path}: {str(exc)}", exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "error": "DatabaseError",
+            "message": "El servicio de base de datos no está disponible temporalmente."
+        }
+    )
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    """Manejador genérico para capturar excepciones no controladas en tiempo de ejecución."""
+    logger.error(f"Error interno no controlado en {request.url.path}: {str(exc)}", exc_info=True)
     return JSONResponse(
-        status_code=500,
-        content={"message": "Error interno del servidor", "detail": str(exc)},
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": "InternalServerError",
+            "message": "Ha ocurrido un error inesperado en el servidor."
+        }
     )
 
-# Incluir rutas
+# 5. Inclusión de las Rutas de la API v1
 app.include_router(api_router, prefix="/api/v1")
 
-@app.get("/")
-def health_check():
-    return {"status": "online", "message": "API RCM operativa"}
-
-def custom_openapi():
-   
-    
-    # Generamos el esquema base con tus rutas reales de FastAPI
-    openapi_schema = get_openapi(
-        title="GreenLive API & External Services",
-        version="1.0.0",
-        description="Documentación unificada. Nota: Las rutas directas de Supabase no pasan por este backend.",
-        routes=app.routes,
-    )
-    
-    # URL de tu proyecto de Supabase (reemplázala por la tuya)
-    supabase_url = "https://seomdmgnzdulnkwjdgmv.supabase.co"
-
-    # 1. Inyectamos visualmente el LOGIN directo a Supabase
-    openapi_schema["paths"]["/auth/v1/token?grant_type=password"] = {
-        "post": {
-            "tags": ["Autenticación Directa (Supabase)"],
-            "summary": "Iniciar Sesión (Directo a Supabase)",
-            "description": f"⚠️ **Llamar directamente a:** `{supabase_url}/auth/v1/token?grant_type=password`\n\nNo pasa por FastAPI para evitar latencia.",
-            "requestBody": {
-                "required": True,
-                "content": {
-                    "application/json": {
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "email": {"type": "string", "format": "email", "example": "usuario@ejemplo.com"},
-                                "password": {"type": "string", "example": "mi_contrasena_segura"}
-                            },
-                            "required": ["email", "password"]
-                        }
-                    }
-                }
-            },
-            "responses": {
-                "200": {
-                    "description": "Sesión iniciada. Devuelve access_token y refresh_token."
-                }
-            }
-        }
+# 6. Endpoint de Monitoreo / Control de Salud (Health Check)
+@app.get("/", tags=["Monitoreo"], status_code=status.HTTP_200_OK)
+async def health_check():
+    """Verifica que el servicio esté en línea y respondiendo adecuadamente."""
+    return {
+        "status": "online",
+        "system": settings.PROJECT_NAME,
+        "version": settings.VERSION
     }
-
-    # 2. Inyectamos visualmente el REFRESH directo a Supabase
-    openapi_schema["paths"]["/auth/v1/token?grant_type=refresh_token"] = {
-        "post": {
-            "tags": ["Autenticación Directa (Supabase)"],
-            "summary": "Refrescar Token (Directo a Supabase)",
-            "description": f"⚠️ **Llamar directamente a:** `{supabase_url}/auth/v1/token?grant_type=refresh_token`\n\nNo pasa por FastAPI.",
-            "requestBody": {
-                "required": True,
-                "content": {
-                    "application/json": {
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "refresh_token": {"type": "string", "example": "tu_refresh_token_aqui"}
-                            },
-                            "required": ["refresh_token"]
-                        }
-                    }
-                }
-            },
-            "responses": {
-                "200": {
-                    "description": "Token renovado con éxito."
-                }
-            }
-        }
-    }
-
-    app.openapi_schema = openapi_schema
-    return app.openapi_schema
