@@ -79,3 +79,44 @@ async def health_check():
         "system": settings.PROJECT_NAME,
         "version": settings.VERSION
     }
+
+
+@app.get("/health", tags=["Monitoreo"], status_code=status.HTTP_200_OK)
+async def health_check_full():
+    """Valida que la base y Supabase estén disponibles."""
+    status_payload = {
+        "status": "online",
+        "system": settings.PROJECT_NAME,
+        "version": settings.VERSION,
+        "database": "unknown",
+        "supabase": "unknown"
+    }
+
+    try:
+        from sqlalchemy import text
+        from db.session import AsyncSessionLocal
+
+        async def probe_db():
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(text("SELECT 1"))
+                return result.scalar_one()
+
+        db_ok = await probe_db() == 1
+        status_payload["database"] = "ok" if db_ok else "failed"
+    except Exception as exc:
+        logger.error(f"Health DB check failed: {exc}")
+        status_payload["database"] = "failed"
+
+    try:
+        from db.supabaseR import get_supabase_admin
+        client = get_supabase_admin()
+        status_payload["supabase"] = "ok" if client.auth.admin is not None else "failed"
+    except Exception as exc:
+        logger.error(f"Health Supabase check failed: {exc}")
+        status_payload["supabase"] = "failed"
+
+    if status_payload["database"] == "failed" or status_payload["supabase"] == "failed":
+        from fastapi import HTTPException
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=status_payload)
+
+    return status_payload
