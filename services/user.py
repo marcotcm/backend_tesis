@@ -250,10 +250,11 @@ async def disable_user(db: AsyncSession, target_user_id: uuid.UUID, current_user
     
     target_user = await get_user_or_404(db, target_user_id)
     await crud_user.soft_delete_user(db, db_obj=target_user)
-    
+    """
     try:
         supabase_admin.auth.admin.delete_user(str(target_user_id))
     except Exception:
         pass  # Si el usuario ya fue eliminado en Auth, se mantiene la coherencia local
+    """
         
     return {"detail": "Usuario inhabilitado y accesos revocados correctamente."}

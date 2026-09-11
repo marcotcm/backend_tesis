@@ -5,7 +5,7 @@ Agrupa todos los sub-enrutadores modulares de la aplicación para ser montados e
 """
 
 from fastapi import APIRouter
-from api.v1.endpoints import equipment, equipment_taxonomy, maintenance, user
+from api.v1.endpoints import equipment, equipment_taxonomy, maintenance, user, equipment_metric
 
 api_router = APIRouter()
 
@@ -16,3 +16,4 @@ api_router.include_router(user.router, prefix="/usuarios", tags=["Usuarios"])
 api_router.include_router(equipment_taxonomy.router, prefix="/taxonomia", tags=["Taxonomía de Equipos"])
 api_router.include_router(equipment.router, prefix="/equipos", tags=["Equipos"])
 api_router.include_router(maintenance.router, prefix="/mantenimientos", tags=["Mantenimientos"])
+api_router.include_router(equipment_metric.router, prefix="/metricas", tags=["Métricas de Equipos"])
