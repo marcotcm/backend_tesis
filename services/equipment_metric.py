@@ -11,8 +11,10 @@ from models.user import User
 
 async def register_metric(db: AsyncSession, metric_in: EquipmentMetricCreate, current_user: User) -> EquipmentMetric:
     """
-    Registra una lectura física. Captura violaciones de llave foránea 
-    por si se intenta registrar a un equipment_id inexistente.
+    Registra una lectura física asociada al usuario autenticado.
+
+    Captura violaciones de llave foránea para informar cuando el equipo
+    no existe y revierte la transacción ante cualquier error de persistencia.
     """
     try:
         return await crud_metric.create_metric(db, obj_in=metric_in, recorded_by_id=current_user.id)
@@ -40,5 +42,10 @@ async def register_metric(db: AsyncSession, metric_in: EquipmentMetricCreate, cu
 async def get_equipment_history(
     db: AsyncSession, equipment_id: uuid.UUID, skip: int, limit: int
 ) -> list[EquipmentMetric]:
-    """Retorna las lecturas históricas de una máquina."""
+    """
+    Retorna el historial paginado de lecturas de un equipo.
+
+    Las lecturas se entregan ordenadas desde la más reciente
+    hasta la más antigua.
+    """
     return await crud_metric.get_metrics_by_equipment(db, equipment_id, skip, limit)

@@ -13,6 +13,12 @@ from schemas.equipment_taxonomy import EquipmentTaxonomyCreate, EquipmentTaxonom
 
 
 async def create_taxonomy(db: AsyncSession, taxonomy_in: EquipmentTaxonomyCreate) -> dict:
+    """
+    Crea un nodo de la jerarquía de activos.
+
+    Cuando se informa parent_id, valida que la categoría padre exista
+    antes de guardar la nueva taxonomía.
+    """
     payload = taxonomy_in.model_dump(exclude_unset=True)
     if payload.get("parent_id"):
         parent = await crud_taxonomy.get_taxonomy_by_id(db, payload["parent_id"])
@@ -27,6 +33,7 @@ async def create_taxonomy(db: AsyncSession, taxonomy_in: EquipmentTaxonomyCreate
 
 
 async def get_taxonomy_or_404(db: AsyncSession, taxonomy_id: uuid.UUID):
+    """Obtiene una taxonomía por UUID o devuelve un error HTTP 404."""
     taxonomy = await crud_taxonomy.get_taxonomy_by_id(db, taxonomy_id)
     if not taxonomy:
         raise HTTPException(
@@ -37,6 +44,7 @@ async def get_taxonomy_or_404(db: AsyncSession, taxonomy_id: uuid.UUID):
 
 
 async def list_taxonomies(db: AsyncSession, skip: int = 0, limit: int = 100):
+    """Devuelve una lista paginada de categorías de la taxonomía."""
     return await crud_taxonomy.get_taxonomies(db=db, skip=skip, limit=limit)
 
 
@@ -45,6 +53,12 @@ async def update_taxonomy(
     taxonomy_id: uuid.UUID,
     taxonomy_in: EquipmentTaxonomyUpdate,
 ):
+    """
+    Actualiza parcialmente una categoría de equipos.
+
+    Valida la nueva categoría padre cuando el cliente solicita
+    mover el nodo dentro de la jerarquía.
+    """
     taxonomy = await get_taxonomy_or_404(db, taxonomy_id)
     update_data = taxonomy_in.model_dump(exclude_unset=True)
 
@@ -60,6 +74,13 @@ async def update_taxonomy(
 
 
 async def delete_taxonomy(db: AsyncSession, taxonomy_id: uuid.UUID):
+    """Elimina una taxonomía solo si ninguna fila depende de ella."""
     taxonomy = await get_taxonomy_or_404(db, taxonomy_id)
+    if await crud_taxonomy.has_children(db, taxonomy_id) or await crud_taxonomy.has_equipments(
+        db, taxonomy_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No se puede eliminar la taxonomía porque tiene equipos o subcategorías asociadas.",
+        )
     await crud_taxonomy.delete_taxonomy(db, taxonomy)
-    return {"detail": "Taxonomía eliminada correctamente."}
