@@ -1,0 +1,1295 @@
+mira tengo esta base de dao de mi tesis recuerdas en supabase
+
+-- WARNING: This schema is for context only and is not meant to be run.
+-- Table order and constraints may not be valid for execution.
+
+CREATE TABLE public.users (
+  id uuid NOT NULL,
+  email character varying NOT NULL UNIQUE CHECK (email::text ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'::text),
+  first_name character varying NOT NULL,
+  last_name character varying NOT NULL,
+  identification_id character varying NOT NULL UNIQUE CHECK (identification_id::text ~ '^[VEP]-[0-9]{6,9}$'::text),
+  birth_date date CHECK (birth_date IS NULL OR birth_date <= (CURRENT_DATE - '18 years'::interval)),
+  phone_number character varying CHECK (phone_number IS NULL OR phone_number::text ~ '^(\+58|0)(412|414|424|416|426|2[0-9]{2})[0-9]{7}$'::text),
+  employee_badge character varying UNIQUE,
+  role USER-DEFINED NOT NULL DEFAULT 'rcm_engineer'::user_role,
+  work_shift USER-DEFINED NOT NULL DEFAULT 'daytime'::turn,
+  specialty character varying,
+  is_active boolean NOT NULL DEFAULT true,
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  deleted_at timestamp with time zone,
+  CONSTRAINT users_pkey PRIMARY KEY (id),
+  CONSTRAINT users_id_fkey FOREIGN KEY (id) REFERENCES auth.users(id)
+);
+CREATE TABLE public.equipment_taxonomy (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  parent_id uuid,
+  name character varying NOT NULL CHECK (TRIM(BOTH FROM name) <> ''::text),
+  level character varying NOT NULL CHECK (level::text = ANY (ARRAY['planta'::character varying, 'sistema'::character varying, 'subsistema'::character varying, 'componente'::character varying]::text[])),
+  description text,
+  created_by uuid,
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT equipment_taxonomy_pkey PRIMARY KEY (id),
+  CONSTRAINT taxonomy_parent_fkey FOREIGN KEY (parent_id) REFERENCES public.equipment_taxonomy(id),
+  CONSTRAINT taxonomy_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id)
+);
+CREATE TABLE public.equipments (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  taxonomy_id uuid NOT NULL,
+  tag_number character varying NOT NULL UNIQUE CHECK (TRIM(BOTH FROM tag_number) <> ''::text),
+  name character varying NOT NULL CHECK (TRIM(BOTH FROM name) <> ''::text),
+  brand character varying,
+  model character varying,
+  equipment_type character varying NOT NULL CHECK (equipment_type::text = ANY (ARRAY['Estatico'::character varying, 'Rotativo'::character varying, 'Electrico'::character varying, 'Instrumentacion'::character varying]::text[])),
+  operational_status character varying NOT NULL DEFAULT 'operational'::character varying CHECK (operational_status::text = ANY (ARRAY['operational'::character varying, 'standby'::character varying, 'under_maintenance'::character varying, 'failed'::character varying]::text[])),
+  technical_specifications jsonb,
+  function_description text,
+  is_active boolean NOT NULL DEFAULT true,
+  created_by uuid NOT NULL,
+  updated_by uuid,
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT equipments_pkey PRIMARY KEY (id),
+  CONSTRAINT equipments_taxonomy_fkey FOREIGN KEY (taxonomy_id) REFERENCES public.equipment_taxonomy(id),
+  CONSTRAINT equipments_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id),
+  CONSTRAINT equipments_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES public.users(id)
+);
+CREATE TABLE public.equipment_metrics_history (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  equipment_id uuid NOT NULL,
+  temperature_celsius numeric CHECK (temperature_celsius IS NULL OR temperature_celsius >= '-50'::integer::numeric AND temperature_celsius <= 1000::numeric),
+  vibration_mm_s numeric CHECK (vibration_mm_s IS NULL OR vibration_mm_s >= 0::numeric),
+  operating_hours numeric,
+  specific_metrics jsonb,
+  notes text,
+  recorded_by uuid NOT NULL,
+  recorded_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT equipment_metrics_history_pkey PRIMARY KEY (id),
+  CONSTRAINT metrics_equipment_fkey FOREIGN KEY (equipment_id) REFERENCES public.equipments(id),
+  CONSTRAINT metrics_recorded_by_fkey FOREIGN KEY (recorded_by) REFERENCES public.users(id)
+);
+CREATE TABLE public.fmea_analyses (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  equipment_id uuid NOT NULL,
+  title character varying NOT NULL,
+  status character varying NOT NULL DEFAULT 'PENDIENTE'::character varying CHECK (status::text = ANY (ARRAY['PENDIENTE'::character varying, 'EN ANÁLISIS'::character varying, 'CERRADO'::character varying]::text[])),
+  severity character varying NOT NULL CHECK (severity::text = ANY (ARRAY['ALTA'::character varying, 'MEDIA'::character varying, 'BAJA'::character varying]::text[])),
+  frequency character varying NOT NULL CHECK (frequency::text = ANY (ARRAY['FRECUENTE'::character varying, 'OCASIONAL'::character varying, 'RARA'::character varying]::text[])),
+  detectability character varying NOT NULL CHECK (detectability::text = ANY (ARRAY['FÁCIL'::character varying, 'MODERADA'::character varying, 'DIFÍCIL'::character varying]::text[])),
+  description text NOT NULL,
+  causes jsonb NOT NULL DEFAULT '[]'::jsonb,
+  effects jsonb NOT NULL DEFAULT '{}'::jsonb,
+  current_controls jsonb NOT NULL DEFAULT '[]'::jsonb,
+  recommended_actions jsonb NOT NULL DEFAULT '[]'::jsonb,
+  created_by uuid NOT NULL,
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fmea_analyses_pkey PRIMARY KEY (id),
+  CONSTRAINT fmea_equipment_fkey FOREIGN KEY (equipment_id) REFERENCES public.equipments(id),
+  CONSTRAINT fmea_created_fkey FOREIGN KEY (created_by) REFERENCES public.users(id)
+);
+CREATE TABLE public.failure_history (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  equipment_id uuid NOT NULL,
+  failure_date timestamp with time zone NOT NULL,
+  failure_mode character varying NOT NULL,
+  severity character varying NOT NULL CHECK (severity::text = ANY (ARRAY['Critico'::character varying, 'Alto'::character varying, 'Medio'::character varying, 'Bajo'::character varying]::text[])),
+  description text NOT NULL,
+  metric_at_failure_id uuid,
+  fmea_analysis_id uuid,
+  downtime_hours numeric CHECK (downtime_hours IS NULL OR downtime_hours >= 0::numeric),
+  reported_by uuid NOT NULL,
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT failure_history_pkey PRIMARY KEY (id),
+  CONSTRAINT failures_equipment_fkey FOREIGN KEY (equipment_id) REFERENCES public.equipments(id),
+  CONSTRAINT failures_reported_by_fkey FOREIGN KEY (reported_by) REFERENCES public.users(id),
+  CONSTRAINT failures_metric_fkey FOREIGN KEY (metric_at_failure_id) REFERENCES public.equipment_metrics_history(id),
+  CONSTRAINT failures_fmea_fkey FOREIGN KEY (fmea_analysis_id) REFERENCES public.fmea_analyses(id)
+);
+CREATE TABLE public.maintenances (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  equipment_id uuid NOT NULL,
+  title character varying NOT NULL,
+  maintenance_type character varying NOT NULL CHECK (maintenance_type::text = ANY (ARRAY['Preventivo'::character varying, 'Predictivo'::character varying, 'Correctivo'::character varying, 'Adaptativo (IA)'::character varying]::text[])),
+  description text,
+  frequency_days integer CHECK (frequency_days IS NULL OR frequency_days > 0),
+  is_active boolean NOT NULL DEFAULT true,
+  created_by uuid NOT NULL,
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT maintenances_pkey PRIMARY KEY (id),
+  CONSTRAINT maintenances_equipment_fkey FOREIGN KEY (equipment_id) REFERENCES public.equipments(id),
+  CONSTRAINT maintenances_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id)
+);
+CREATE TABLE public.work_orders (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  maintenance_id uuid NOT NULL,
+  assigned_to uuid,
+  status character varying NOT NULL DEFAULT 'Pendiente'::character varying CHECK (status::text = ANY (ARRAY['Pendiente'::character varying, 'En Proceso'::character varying, 'Terminado'::character varying, 'Cancelado'::character varying]::text[])),
+  priority character varying NOT NULL DEFAULT 'Normal'::character varying CHECK (priority::text = ANY (ARRAY['Baja'::character varying, 'Normal'::character varying, 'Alta'::character varying, 'Urgente'::character varying]::text[])),
+  scheduled_for timestamp with time zone,
+  started_at timestamp with time zone,
+  completed_at timestamp with time zone,
+  technician_notes text,
+  created_by uuid NOT NULL,
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT work_orders_pkey PRIMARY KEY (id),
+  CONSTRAINT work_orders_maintenance_fkey FOREIGN KEY (maintenance_id) REFERENCES public.maintenances(id),
+  CONSTRAINT work_orders_assigned_to_fkey FOREIGN KEY (assigned_to) REFERENCES public.users(id),
+  CONSTRAINT work_orders_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id)
+);
+CREATE TABLE public.maintenance_history (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  equipment_id uuid NOT NULL,
+  work_order_id uuid,
+  was_failure_driven boolean NOT NULL DEFAULT false,
+  failure_id uuid,
+  execution_date timestamp with time zone NOT NULL,
+  action_taken text NOT NULL,
+  replaced_parts jsonb,
+  real_downtime_hours numeric CHECK (real_downtime_hours IS NULL OR real_downtime_hours >= 0::numeric),
+  start_metric_id uuid,
+  end_metric_id uuid,
+  executed_by uuid NOT NULL,
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT maintenance_history_pkey PRIMARY KEY (id),
+  CONSTRAINT maint_history_equip_fkey FOREIGN KEY (equipment_id) REFERENCES public.equipments(id),
+  CONSTRAINT maint_history_wo_fkey FOREIGN KEY (work_order_id) REFERENCES public.work_orders(id),
+  CONSTRAINT maint_history_failure_fkey FOREIGN KEY (failure_id) REFERENCES public.failure_history(id),
+  CONSTRAINT maint_history_exec_fkey FOREIGN KEY (executed_by) REFERENCES public.users(id),
+  CONSTRAINT maint_start_metric_fkey FOREIGN KEY (start_metric_id) REFERENCES public.equipment_metrics_history(id),
+  CONSTRAINT maint_end_metric_fkey FOREIGN KEY (end_metric_id) REFERENCES public.equipment_metrics_history(id)
+);
+CREATE TABLE public.equipment_criticality (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  equipment_id uuid NOT NULL UNIQUE,
+  safety_impact_score integer NOT NULL,
+  environmental_impact_score integer NOT NULL,
+  operational_impact_score integer NOT NULL,
+  maintenance_cost_score integer NOT NULL,
+  rpn_score integer NOT NULL,
+  criticality_level character varying NOT NULL CHECK (criticality_level::text = ANY (ARRAY['Alta'::character varying, 'Media'::character varying, 'Baja'::character varying]::text[])),
+  evaluated_by uuid NOT NULL,
+  evaluated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT equipment_criticality_pkey PRIMARY KEY (id),
+  CONSTRAINT criticality_equipment_fkey FOREIGN KEY (equipment_id) REFERENCES public.equipments(id),
+  CONSTRAINT criticality_evaluated_fkey FOREIGN KEY (evaluated_by) REFERENCES public.users(id)
+);
+CREATE TABLE public.ai_recommendations (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  equipment_id uuid NOT NULL,
+  trigger_source character varying NOT NULL,
+  trigger_reference_id uuid,
+  recommendation_text text NOT NULL,
+  confidence_score numeric NOT NULL CHECK (confidence_score >= 0::numeric AND confidence_score <= 100::numeric),
+  prediction_type character varying NOT NULL,
+  status character varying NOT NULL DEFAULT 'Pendiente'::character varying CHECK (status::text = ANY (ARRAY['Pendiente'::character varying, 'Aceptada'::character varying, 'Rechazada'::character varying]::text[])),
+  resolved_by uuid,
+  resolved_at timestamp with time zone,
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT ai_recommendations_pkey PRIMARY KEY (id),
+  CONSTRAINT ai_recs_resolved_fkey FOREIGN KEY (resolved_by) REFERENCES public.users(id),
+  CONSTRAINT ai_recs_equipment_fkey FOREIGN KEY (equipment_id) REFERENCES public.equipments(id)
+);
+CREATE TABLE public.ai_corrections (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  recommendation_id uuid NOT NULL UNIQUE,
+  corrected_text text NOT NULL,
+  corrected_by uuid NOT NULL,
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT ai_corrections_pkey PRIMARY KEY (id),
+  CONSTRAINT ai_corrections_rec_fkey FOREIGN KEY (recommendation_id) REFERENCES public.ai_recommendations(id),
+  CONSTRAINT ai_corrections_user_fkey FOREIGN KEY (corrected_by) REFERENCES public.users(id)
+);
+
+
+de esa ya llevo desarrolada 
+users
+equipment_taxonomy
+equipments
+equipment_metrics_history
+y maintenances
+
+este es el ejemplo de usuario que manejamos 
+model
+"""
+Modelo ORM para la Tabla de Usuarios del Sistema RCM.
+
+Mapea la tabla 'public.users' y sincroniza su identificador primario
+directamente con el UUID de la tabla 'auth.users' de Supabase Auth.
+"""
+
+import enum
+import uuid
+from datetime import datetime, timezone
+from sqlalchemy import Column, String, Boolean, Date, DateTime
+from sqlalchemy.dialects.postgresql import UUID, ENUM
+from db.session import Base
+
+class UserRole(str, enum.Enum):
+    """Roles operativos con control de acceso granular en la plataforma RCM."""
+    admin = "admin"
+    rcm_engineer = "rcm_engineer"
+    technical_auditor = "technical_auditor"
+
+class Turn(str, enum.Enum):
+    """Turnos de trabajo operativo para el personal de planta."""
+    daytime = "daytime"
+    nighttime = "nighttime"
+
+# Vinculación explícita con los tipos ENUM nativos preexistentes en PostgreSQL (public schema)
+user_role_enum = ENUM(UserRole, name="user_role", schema="public", create_type=False)
+turn_enum = ENUM(Turn, name="turn", schema="public", create_type=False)
+
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = {"schema": "public"}
+
+    # Identificador único UUID vinculado 1:1 con auth.users(id)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email = Column(String, unique=True, nullable=False, index=True)
+    first_name = Column(String, nullable=False)
+    last_name = Column(String, nullable=False)
+    identification_id = Column(String, unique=True, nullable=False, index=True)  # Cédula (V-, E-, P-)
+    birth_date = Column(Date, nullable=True)
+    phone_number = Column(String, nullable=True)
+    employee_badge = Column(String, unique=True, nullable=True)  # Número de ficha/carnet
+    
+    # Atributos enumerados
+    role = Column(user_role_enum, nullable=False, default=UserRole.rcm_engineer)
+    work_shift = Column(turn_enum, nullable=False, default=Turn.daytime)
+    
+    # Metadatos del perfil y control de estado
+    specialty = Column(String, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)  # Marca temporal para soft-delete
+echema
+"""
+Esquemas Pydantic para Serialización y Validación de Datos de Usuario.
+
+Asegura que los datos entrantes cumplan con las reglas de negocio y restricciones
+(Regex para cédulas venezolanas, teléfonos y verificación de mayoría de edad).
+"""
+
+import re
+import uuid
+from datetime import date, datetime
+from typing import Optional
+from pydantic import BaseModel, EmailStr, field_validator
+from models.user import UserRole, Turn
+
+class UserBase(BaseModel):
+    """Campos base compartidos por múltiples esquemas de usuario."""
+    email: EmailStr
+    first_name: str
+    last_name: str
+    identification_id: str
+    birth_date: Optional[date] = None
+    phone_number: Optional[str] = None
+    employee_badge: Optional[str] = None
+    role: UserRole = UserRole.rcm_engineer
+    work_shift: Turn = Turn.daytime
+    specialty: Optional[str] = None
+
+    @field_validator("identification_id")
+    @classmethod
+    def validate_identification(cls, v: str) -> str:
+        """Valida que la cédula cumpla con el formato legal de Venezuela (V-, E-, P- seguido de 6 a 9 dígitos)."""
+        if not re.match(r"^[VEP]-[0-9]{6,9}$", v):
+            raise ValueError("La identificación debe tener un formato válido (e.g., V-12345678, E-12345678, P-12345678).")
+        return v
+
+    @field_validator("phone_number")
+    @classmethod
+    def validate_phone(cls, v: Optional[str]) -> Optional[str]:
+        """Valida códigos de área o celulares nacionales venezolanos (+58 o 0 seguido de código de operadora)."""
+        if v is not None and not re.match(r"^(\+58|0)(412|414|424|416|426|2[0-9]{2})[0-9]{7}$", v):
+            raise ValueError("El número de teléfono no cumple con el formato de numeración telefónica válido.")
+        return v
+
+    @field_validator("birth_date")
+    @classmethod
+    def validate_adult(cls, v: Optional[date]) -> Optional[date]:
+        """Garantiza la mayoría de edad (mínimo 18 años) según la fecha de nacimiento."""
+        if v is not None:
+            today = date.today()
+            age = today.year - v.year - ((today.month, today.day) < (v.month, v.day))
+            if age < 18:
+                raise ValueError("El usuario debe ser mayor de edad (+18 años) para ser registrado.")
+        return v
+
+class UserCreate(UserBase):
+    """Esquema de entrada para el registro de nuevos usuarios en el sistema."""
+    password: str
+
+class UserUpdate(BaseModel):
+    """Esquema para actualizaciones parciales (PATCH). Todos los campos son opcionales."""
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phone_number: Optional[str] = None
+    employee_badge: Optional[str] = None
+    work_shift: Optional[Turn] = None
+    specialty: Optional[str] = None
+    role: Optional[UserRole] = None
+    is_active: Optional[bool] = None
+
+    @field_validator("phone_number")
+    @classmethod
+    def validate_phone_update(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not re.match(r"^(\+58|0)(412|414|424|416|426|2[0-9]{2})[0-9]{7}$", v):
+            raise ValueError("El número de teléfono no cumple con el formato válido.")
+        return v
+
+class UserResponse(UserBase):
+    """Esquema de salida serializado que expone la información pública del usuario."""
+    id: uuid.UUID
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+    deleted_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True  # Compatibilidad con objetos ORM de SQLAlchemy
+
+class UserLogin(BaseModel):
+    """Credenciales requeridas para el inicio de sesión."""
+    email: EmailStr
+    password: str
+
+class TokenRefreshRequest(BaseModel):
+    """Cuerpo de solicitud para refrescar un token de acceso expirado."""
+    refresh_token: str
+
+class TokenResponse(BaseModel):
+    """Estructura de respuesta que emite los tokens JWT junto con el perfil cargado."""
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+class ForgotPasswordRequest(BaseModel):
+    """Cuerpo de solicitud para iniciar el proceso de recuperación de contraseña."""
+    email: EmailStr
+crud
+"""
+Esquemas Pydantic para Serialización y Validación de Datos de Usuario.
+
+Asegura que los datos entrantes cumplan con las reglas de negocio y restricciones
+(Regex para cédulas venezolanas, teléfonos y verificación de mayoría de edad).
+"""
+
+import re
+import uuid
+from datetime import date, datetime
+from typing import Optional
+from pydantic import BaseModel, EmailStr, field_validator
+from models.user import UserRole, Turn
+
+class UserBase(BaseModel):
+    """Campos base compartidos por múltiples esquemas de usuario."""
+    email: EmailStr
+    first_name: str
+    last_name: str
+    identification_id: str
+    birth_date: Optional[date] = None
+    phone_number: Optional[str] = None
+    employee_badge: Optional[str] = None
+    role: UserRole = UserRole.rcm_engineer
+    work_shift: Turn = Turn.daytime
+    specialty: Optional[str] = None
+
+    @field_validator("identification_id")
+    @classmethod
+    def validate_identification(cls, v: str) -> str:
+        """Valida que la cédula cumpla con el formato legal de Venezuela (V-, E-, P- seguido de 6 a 9 dígitos)."""
+        if not re.match(r"^[VEP]-[0-9]{6,9}$", v):
+            raise ValueError("La identificación debe tener un formato válido (e.g., V-12345678, E-12345678, P-12345678).")
+        return v
+
+    @field_validator("phone_number")
+    @classmethod
+    def validate_phone(cls, v: Optional[str]) -> Optional[str]:
+        """Valida códigos de área o celulares nacionales venezolanos (+58 o 0 seguido de código de operadora)."""
+        if v is not None and not re.match(r"^(\+58|0)(412|414|424|416|426|2[0-9]{2})[0-9]{7}$", v):
+            raise ValueError("El número de teléfono no cumple con el formato de numeración telefónica válido.")
+        return v
+
+    @field_validator("birth_date")
+    @classmethod
+    def validate_adult(cls, v: Optional[date]) -> Optional[date]:
+        """Garantiza la mayoría de edad (mínimo 18 años) según la fecha de nacimiento."""
+        if v is not None:
+            today = date.today()
+            age = today.year - v.year - ((today.month, today.day) < (v.month, v.day))
+            if age < 18:
+                raise ValueError("El usuario debe ser mayor de edad (+18 años) para ser registrado.")
+        return v
+
+class UserCreate(UserBase):
+    """Esquema de entrada para el registro de nuevos usuarios en el sistema."""
+    password: str
+
+class UserUpdate(BaseModel):
+    """Esquema para actualizaciones parciales (PATCH). Todos los campos son opcionales."""
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phone_number: Optional[str] = None
+    employee_badge: Optional[str] = None
+    work_shift: Optional[Turn] = None
+    specialty: Optional[str] = None
+    role: Optional[UserRole] = None
+    is_active: Optional[bool] = None
+
+    @field_validator("phone_number")
+    @classmethod
+    def validate_phone_update(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not re.match(r"^(\+58|0)(412|414|424|416|426|2[0-9]{2})[0-9]{7}$", v):
+            raise ValueError("El número de teléfono no cumple con el formato válido.")
+        return v
+
+class UserResponse(UserBase):
+    """Esquema de salida serializado que expone la información pública del usuario."""
+    id: uuid.UUID
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+    deleted_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True  # Compatibilidad con objetos ORM de SQLAlchemy
+
+class UserLogin(BaseModel):
+    """Credenciales requeridas para el inicio de sesión."""
+    email: EmailStr
+    password: str
+
+class TokenRefreshRequest(BaseModel):
+    """Cuerpo de solicitud para refrescar un token de acceso expirado."""
+    refresh_token: str
+
+class TokenResponse(BaseModel):
+    """Estructura de respuesta que emite los tokens JWT junto con el perfil cargado."""
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+class ForgotPasswordRequest(BaseModel):
+    """Cuerpo de solicitud para iniciar el proceso de recuperación de contraseña."""
+    email: EmailStr
+services
+"""
+Capa de Servicios y Reglas de Negocio para la Gestión de Usuarios.
+
+Coordina las operaciones entre Supabase Auth y PostgreSQL garantizando
+atomicidad (rollback en el proveedor de identidad si falla la persistencia local).
+"""
+
+import uuid
+import traceback
+from typing import Optional
+from fastapi import HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from supabase import Client
+from supabase_auth.errors import AuthApiError
+from pydantic import EmailStr
+
+from crud import user as crud_user
+from schemas.user import UserCreate, UserUpdate, UserLogin
+from models.user import User, UserRole
+
+async def register_user(db: AsyncSession, user_in: UserCreate, supabase_admin: Client) -> User:
+    """
+    Registra un usuario de forma atómica.
+    1. Valida unicidad local de correo y cédula.
+    2. Crea la cuenta en Supabase Auth.
+    3. Persiste el perfil en PostgreSQL (con rollback en Supabase ante excepciones).
+    """
+    if await crud_user.get_user_by_email(db, user_in.email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="El correo electrónico ya se encuentra registrado en el sistema."
+        )
+    
+    if await crud_user.get_user_by_identification(db, user_in.identification_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="La cédula de identidad ya se encuentra asignada a otro trabajador."
+        )
+
+    # Registro en Supabase Auth
+    try:
+        auth_response = supabase_admin.auth.admin.create_user({
+            "email": user_in.email,
+            "password": user_in.password,
+            "email_confirm": True
+        })
+        auth_user_id = uuid.UUID(auth_response.user.id)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail=f"Error en el servicio de autenticación externo: {str(e)}"
+        )
+
+    # Persistencia local con mecanismo de compensación (Rollback)
+    try:
+        return await crud_user.create_user(db, obj_in=user_in, auth_user_id=auth_user_id)
+    except Exception as e:
+        traceback.print_exc()
+        try:
+            # Elimina el usuario recién creado en Auth si falla la base de datos
+            supabase_admin.auth.admin.delete_user(str(auth_user_id))
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail=f"Fallo al guardar el perfil local. Operación revertida: {str(e)}"
+        )
+
+async def login_user(db: AsyncSession, credentials: UserLogin, supabase_client: Client) -> dict:
+    """
+    Autentica al usuario contra Supabase Auth y valida el estado operativo en PostgreSQL.
+    """
+    try:
+        auth_response = supabase_client.auth.sign_in_with_password({
+            "email": credentials.email,
+            "password": credentials.password
+        })
+        
+        user_uuid = uuid.UUID(auth_response.user.id)
+        local_user = await crud_user.get_user_by_id(db, user_uuid)
+        
+        if not local_user or not local_user.is_active or local_user.deleted_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, 
+                detail="Esta cuenta ha sido inhabilitada o dada de baja administrativamente."
+            )
+            
+        return {
+            "access_token": auth_response.session.access_token,
+            "refresh_token": auth_response.session.refresh_token,
+            "token_type": "bearer",
+            "user": local_user
+        }
+    except AuthApiError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, 
+            detail="Credenciales de acceso incorrectas."
+        )
+
+async def refresh_session(db: AsyncSession, refresh_token: str, supabase_client: Client) -> dict:
+    """Renueva los tokens JWT utilizando un refresh token activo."""
+    try:
+        auth_response = supabase_client.auth.refresh_session(refresh_token)
+        user_uuid = uuid.UUID(auth_response.user.id)
+        local_user = await crud_user.get_user_by_id(db, user_uuid)
+        
+        if not local_user or not local_user.is_active or local_user.deleted_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, 
+                detail="La cuenta asociada ha sido desactivada."
+            )
+            
+        return {
+            "access_token": auth_response.session.access_token,
+            "refresh_token": auth_response.session.refresh_token,
+            "token_type": "bearer",
+            "user": local_user
+        }
+    except AuthApiError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="El token de refresco no es válido o ha expirado."
+        )
+
+async def request_password_reset(email: EmailStr, supabase_client: Client) -> dict:
+    """Envía el correo de restablecimiento de contraseña mediante el proveedor de Auth."""
+    try:
+        supabase_client.auth.reset_password_for_email(email)
+        return {"detail": "Si el correo existe en la plataforma, se ha enviado el enlace de restablecimiento."}
+    except AuthApiError as e:
+        # Captura errores específicos de validación de Supabase Auth
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail=f"Error en el servicio de correo de autenticación: {e.message}"
+        )
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail="Error interno al procesar la solicitud de recuperación."
+        )
+
+async def get_user_or_404(db: AsyncSession, user_id: uuid.UUID) -> User:
+    """Obtiene un usuario por ID o genera un error 404 estructurado."""
+    user = await crud_user.get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado.")
+    return user
+
+async def get_user_by_email_or_404(db: AsyncSession, email: str) -> User:
+    """Obtiene un usuario por Correo o genera un error 404 estructurado."""
+    user = await crud_user.get_user_by_email(db, email)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado.")
+    return user
+
+async def update_user_profile(
+    db: AsyncSession, 
+    target_user_id: uuid.UUID, 
+    user_in: UserUpdate, 
+    current_user: User,
+    supabase_admin: Optional[Client] = None
+) -> User:
+    """
+    Actualiza el perfil garantizando permisos, unicidad de datos y sincronización con Supabase Auth.
+    Convierte el modelo a un diccionario excluyendo campos no enviados (exclude_unset=True)
+    y previene que usuarios comunes alteren roles o su estado activo.
+    """
+    # 1. Validación de permisos: Solo el propio usuario o un Administrador
+    if current_user.id != target_user_id and current_user.role != UserRole.admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="No tiene permisos para modificar datos de otro usuario."
+        )
+    
+    target_user = await get_user_or_404(db, target_user_id)
+
+    # 2. Extracción limpia: solo campos explícitamente enviados en la solicitud JSON
+    update_dict = user_in.model_dump(exclude_unset=True)
+
+    # 3. Control de privilegios: descartar campos administrativos si no es admin (sin reasignar None)
+    if current_user.role != UserRole.admin:
+        update_dict.pop("role", None)
+        update_dict.pop("is_active", None)
+
+    # 4. Validación de unicidad si se actualiza la cédula
+    if "identification_id" in update_dict and update_dict["identification_id"] != target_user.identification_id:
+        existing_id = await crud_user.get_user_by_identification(db, update_dict["identification_id"])
+        if existing_id and existing_id.id != target_user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="La cédula de identidad ingresada ya se encuentra registrada por otro usuario."
+            )
+
+    # 5. Sincronización y unicidad si se actualiza el correo electrónico
+    old_email = target_user.email
+    if "email" in update_dict and update_dict["email"] != target_user.email:
+        existing_email = await crud_user.get_user_by_email(db, update_dict["email"])
+        if existing_email and existing_email.id != target_user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="El correo electrónico ingresado ya se encuentra registrado."
+            )
+        
+        # Sincronización con Supabase Auth
+        if supabase_admin:
+            try:
+                supabase_admin.auth.admin.update_user_by_id(
+                    str(target_user_id),
+                    {"email": update_dict["email"], "email_confirm": True}
+                )
+            except Exception as e:
+                traceback.print_exc()
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Error al sincronizar el nuevo correo con el proveedor de autenticación: {str(e)}"
+                )
+
+    # 6. Si no hay modificaciones tras aplicar los filtros, retornar el estado actual
+    if not update_dict:
+        return target_user
+
+    # 7. Persistencia local pasando el diccionario limpio
+    try:
+        return await crud_user.update_user(db, db_obj=target_user, update_data=update_dict)
+    except Exception as e:
+        # Mecanismo de compensación: revertir correo en Supabase ante error en Postgres
+        if supabase_admin and "email" in update_dict and update_dict["email"] != old_email:
+            try:
+                supabase_admin.auth.admin.update_user_by_id(
+                    str(target_user_id),
+                    {"email": old_email, "email_confirm": True}
+                )
+            except Exception:
+                pass
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al actualizar el perfil en la base de datos local: {str(e)}"
+        )
+
+async def disable_user(db: AsyncSession, target_user_id: uuid.UUID, current_user: User, supabase_admin: Client) -> dict:
+    """Aplica soft-delete local y revoca definitivamente el acceso eliminando la cuenta en Supabase Auth."""
+    if current_user.id != target_user_id and current_user.role != UserRole.admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="No tiene permisos para dar de baja este usuario."
+        )
+    
+    target_user = await get_user_or_404(db, target_user_id)
+    await crud_user.soft_delete_user(db, db_obj=target_user)
+    """
+    try:
+        supabase_admin.auth.admin.delete_user(str(target_user_id))
+    except Exception:
+        pass  # Si el usuario ya fue eliminado en Auth, se mantiene la coherencia local
+    """
+        
+    return {"detail": "Usuario inhabilitado y accesos revocados correctamente."}
+
+routes/endpoints 
+"""
+Rutas y Controladores de la API para el Módulo de Usuarios (Sistema RCM).
+
+Define los endpoints RESTful protegidos y documentados para Swagger/OpenAPI,
+gestionando la interacción con Supabase Auth y la base de datos local.
+"""
+
+import uuid
+from typing import List
+from fastapi import APIRouter, Depends, Query, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from supabase import Client
+from pydantic import EmailStr
+
+from db.session import get_db
+from db.supabaseR import get_supabase_admin
+from core.security import get_current_user, RoleChecker
+from models.user import User, UserRole
+from schemas.user import (
+    UserCreate, 
+    UserUpdate, 
+    UserResponse, 
+    UserLogin, 
+    TokenResponse, 
+    TokenRefreshRequest, 
+    ForgotPasswordRequest
+)
+from services import user as user_service
+from crud import user as crud_user
+
+router = APIRouter()
+
+@router.post("/registro", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+async def registrar_usuario(
+    user_in: UserCreate,
+    db: AsyncSession = Depends(get_db),
+    supabase_admin: Client = Depends(get_supabase_admin)
+):
+    """
+    * **Ruta:** POST /api/v1/usuarios/registro
+    * **Token:** No requiere
+    * **Nivel de permiso:** Público (Cualquier visitante o administrador)
+    * **Uso:** Recibe los datos personales, rol técnico, turno operativo y contraseña del nuevo trabajador.
+    * **Resultado:** Registra de forma segura las credenciales en Supabase Auth y crea el perfil técnico en PostgreSQL de manera atómica con rollback automático ante fallos.
+    """
+    return await user_service.register_user(db=db, user_in=user_in, supabase_admin=supabase_admin)
+
+
+@router.post("/login", response_model=TokenResponse, status_code=status.HTTP_200_OK)
+async def login(
+    credentials: UserLogin,
+    db: AsyncSession = Depends(get_db),
+    supabase_client: Client = Depends(get_supabase_admin)
+):
+    """
+    * **Ruta:** POST /api/v1/usuarios/login
+    * **Token:** No requiere
+    * **Nivel de permiso:** Público
+    * **Uso:** Recibe las credenciales corporativas (email y password) del trabajador.
+    * **Resultado:** Valida contra Supabase Auth, confirma que la cuenta esté activa (`is_active: true`) y retorna el par de tokens JWT (`access_token` y `refresh_token`) junto con el perfil completo.
+    """
+    return await user_service.login_user(db=db, credentials=credentials, supabase_client=supabase_client)
+
+
+@router.post("/refresh", response_model=TokenResponse, status_code=status.HTTP_200_OK)
+async def refresh_token(
+    payload: TokenRefreshRequest,
+    db: AsyncSession = Depends(get_db),
+    supabase_client: Client = Depends(get_supabase_admin)
+):
+    """
+    * **Ruta:** POST /api/v1/usuarios/refresh
+    * **Token:** No requiere (Se transfiere en el cuerpo JSON de la petición)
+    * **Nivel de permiso:** Público
+    * **Uso:** Envía el `refresh_token` provisto en el login cuando el access token haya caducado.
+    * **Resultado:** Emite un nuevo access token manteniendo la sesión activa del usuario sin requerir reautenticación manual.
+    """
+    return await user_service.refresh_session(db=db, refresh_token=payload.refresh_token, supabase_client=supabase_client)
+
+
+@router.post("/recuperar-contrasena", status_code=status.HTTP_200_OK)
+async def recuperar_contrasena(
+    payload: ForgotPasswordRequest,
+    supabase_client: Client = Depends(get_supabase_admin)
+):
+    """
+    * **Ruta:** POST /api/v1/usuarios/recuperar-contrasena
+    * **Token:** No requiere
+    * **Nivel de permiso:** Público
+    * **Uso:** Recibe el correo electrónico registrado del trabajador.
+    * **Resultado:** Dispara un correo con enlace seguro de restablecimiento de contraseña gestionado por Supabase Auth.
+    """
+    return await user_service.request_password_reset(email=payload.email, supabase_client=supabase_client)
+
+
+@router.get("/me", response_model=UserResponse, status_code=status.HTTP_200_OK)
+async def obtener_mi_perfil(current_user: User = Depends(get_current_user)):
+    """
+    * **Ruta:** GET /api/v1/usuarios/me
+    * **Token:** Requiere (Bearer JWT)
+    * **Nivel de permiso:** Usuario Autenticado (Cualquier Rol)
+    * **Uso:** Obtiene la ficha técnica e información de perfil del usuario logueado en la sesión activa.
+    * **Resultado:** Retorna los datos asociados al token validado (especialidad, rol, turno y datos de contacto).
+    """
+    return current_user
+
+
+@router.get(
+    "/", 
+    response_model=List[UserResponse], 
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RoleChecker([UserRole.admin, UserRole.technical_auditor]))]
+)
+async def listar_usuarios(
+    skip: int = Query(0, ge=0, description="Número de registros a omitir para paginación"),
+    limit: int = Query(100, ge=1, le=500, description="Límite de registros a recuperar"),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    * **Ruta:** GET /api/v1/usuarios/
+    * **Token:** Requiere (Bearer JWT)
+    * **Nivel de permiso:** Administrador (`admin`) o Auditor Técnico (`technical_auditor`)
+    * **Uso:** Consulta el listado completo y paginado del personal operativo activo en la plataforma RCM.
+    * **Resultado:** Retorna un arreglo JSON con los perfiles técnicos de los usuarios que no han sido dados de baja.
+    """
+    return await crud_user.get_users(db=db, skip=skip, limit=limit)
+
+
+@router.get("/buscar", response_model=List[UserResponse], status_code=status.HTTP_200_OK)
+async def buscar_usuarios(
+    nombre: str = Query(..., min_length=2, description="Texto parcial de nombre o apellido"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    * **Ruta:** GET /api/v1/usuarios/buscar?nombre={valor}
+    * **Token:** Requiere (Bearer JWT)
+    * **Nivel de permiso:** Usuario Autenticado (Cualquier Rol)
+    * **Uso:** Filtra usuarios en tiempo real por coincidencia parcial en nombre o apellido (no sensible a mayúsculas).
+    * **Resultado:** Retorna una lista con todos los perfiles activos que coincidan con el criterio de búsqueda.
+    """
+    return await crud_user.search_users_by_name(db, nombre)
+
+
+@router.get("/buscar-email", response_model=UserResponse, status_code=status.HTTP_200_OK)
+async def buscar_usuario_por_email(
+    email: EmailStr = Query(..., description="Correo electrónico exacto del usuario"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    * **Ruta:** GET /api/v1/usuarios/buscar-email?email={correo}
+    * **Token:** Requiere (Bearer JWT)
+    * **Nivel de permiso:** Usuario Autenticado (Cualquier Rol)
+    * **Uso:** Busca la información de un usuario mediante su dirección de correo institucional exacta.
+    * **Resultado:** Devuelve el perfil completo del usuario. Retorna error 404 si no existe o fue dado de baja.
+    """
+    return await user_service.get_user_by_email_or_404(db, email)
+
+
+@router.get("/{id}", response_model=UserResponse, status_code=status.HTTP_200_OK)
+async def obtener_usuario(
+    id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    * **Ruta:** GET /api/v1/usuarios/{id}
+    * **Token:** Requiere (Bearer JWT)
+    * **Nivel de permiso:** Usuario Autenticado (Cualquier Rol)
+    * **Uso:** Pasa el UUID del usuario en la ruta para consultar su ficha técnica completa.
+    * **Resultado:** Muestra el perfil solicitado o genera una excepción 404 si no existe en la base de datos.
+    """
+    return await user_service.get_user_or_404(db, id)
+
+
+@router.patch("/{id}", response_model=UserResponse, status_code=status.HTTP_200_OK)
+async def actualizar_perfil(
+    id: uuid.UUID,
+    user_in: UserUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    * **Ruta:** PATCH /api/v1/usuarios/{id}
+    * **Token:** Requiere (Bearer JWT)
+    * **Nivel de permiso:** Propietario de la cuenta o Administrador (`admin`)
+    * **Uso:** Envía en el cuerpo JSON únicamente los campos a actualizar (teléfono, ficha, turno, etc.).
+    * **Resultado:** Aplica los cambios y actualiza el campo `updated_at`. Previene que un usuario común altere su propio rol.
+    """
+    return await user_service.update_user_profile(db=db, target_user_id=id, user_in=user_in, current_user=current_user)
+
+
+@router.delete("/{id}", status_code=status.HTTP_200_OK)
+async def eliminar_usuario(
+    id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    supabase_admin: Client = Depends(get_supabase_admin)
+):
+    """
+    * **Ruta:** DELETE /api/v1/usuarios/{id}
+    * **Token:** Requiere (Bearer JWT)
+    * **Nivel de permiso:** Propietario de la cuenta o Administrador (`admin`)
+    * **Uso:** Envía el UUID del usuario a eliminar del sistema RCM.
+    * **Resultado:** Aplica baja lógica registrando la marca temporal en `deleted_at`, desactiva el flag `is_active` y revoca accesos en Supabase Auth.
+    """
+    return await user_service.disable_user(db=db, target_user_id=id, current_user=current_user, supabase_admin=supabase_admin)
+
+
+=====================================
+-- SCRIPT DE CREACIÓN RCM (DICCIONARIO DE DATOS COMPLETO)
+-- ORDENADO ESTRICTAMENTE POR DEPENDENCIAS PARA EVITAR ERRORES DE LLAVES FORÁNEAS
+-- =================================================================================
+
+-- =================================================================================
+-- 0. CREACIÓN DE TIPOS ENUMERADOS (ENUMS)
+-- DESCRIPCIÓN: Tipos de datos personalizados basados en tu panel de Supabase.
+-- Deben crearse antes que las tablas que los utilizan.
+-- =================================================================================
+CREATE TYPE public.turn AS ENUM ('daytime', 'nighttime');
+CREATE TYPE public.user_role AS ENUM ('admin', 'rcm_engineer', 'technical_auditor');
+
+-- =================================================================================
+-- 1. TABLA: users 
+-- =================================================================================
+CREATE TABLE public.users (
+  id uuid NOT NULL, -- Identificador único del usuario (vinculado a auth.users).
+  email character varying NOT NULL UNIQUE, -- Correo electrónico único para acceso y notificaciones.
+  first_name character varying NOT NULL, -- Nombre de pila del trabajador.
+  last_name character varying NOT NULL, -- Apellidos del trabajador.
+  identification_id character varying NOT NULL UNIQUE, -- Cédula de identidad (Formato V-, E-, P-).
+  birth_date date, -- Fecha de nacimiento para validar la mayoría de edad.
+  phone_number character varying, -- Teléfono de contacto (Formato venezolano +58 o 0).
+  employee_badge character varying UNIQUE, -- Número de carnet o ficha corporativa.
+  
+  -- Aquí se aplican los ENUMs creados arriba
+  role public.user_role NOT NULL DEFAULT 'rcm_engineer'::public.user_role, -- Nivel de permisos en el sistema RCM.
+  work_shift public.turn NOT NULL DEFAULT 'daytime'::public.turn, -- Turno operativo (diurno, nocturno).
+  
+  specialty character varying, -- Especialidad técnica (Mecánico, Instrumentista, etc.).
+  is_active boolean NOT NULL DEFAULT true, -- Bandera lógica para deshabilitar usuarios sin borrar su historial.
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Fecha y hora de registro en la plataforma.
+  updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Fecha y hora de la última modificación del perfil.
+  deleted_at timestamp with time zone, -- Fecha de borrado lógico (si se decide implementar soft-deletes puros).
+  
+  CONSTRAINT users_pkey PRIMARY KEY (id),
+  CONSTRAINT users_id_fkey FOREIGN KEY (id) REFERENCES auth.users(id) ON DELETE CASCADE,
+  CONSTRAINT chk_users_identification_id CHECK (identification_id ~ '^[VEP]-[0-9]{6,9}$'),
+  CONSTRAINT chk_users_phone_number CHECK (phone_number IS NULL OR phone_number ~ '^(\+58|0)(412|414|424|416|426|2[0-9]{2})[0-9]{7}$'),
+  CONSTRAINT chk_users_email CHECK (email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'),
+  CONSTRAINT chk_users_adult CHECK (birth_date IS NULL OR birth_date <= CURRENT_DATE - INTERVAL '18 years')
+);
+
+-- =================================================================================
+-- 2. TABLA: equipment_taxonomy 
+-- =================================================================================
+CREATE TABLE public.equipment_taxonomy (
+  id uuid DEFAULT gen_random_uuid() NOT NULL, -- Identificador único del nivel taxonómico.
+  parent_id uuid, -- ID del nivel superior (NULL si es la planta principal).
+  name character varying NOT NULL, -- Nombre comercial o técnico de la instalación/sistema.
+  level character varying NOT NULL, -- Categoría ISO (planta, sistema, subsistema, componente).
+  description text, -- Detalle textual sobre el propósito operativo de esta agrupación.
+  created_by uuid, -- ID del ingeniero que estructuró este nivel en el sistema.
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Marca temporal de creación.
+  
+  CONSTRAINT taxonomy_pkey PRIMARY KEY (id),
+  CONSTRAINT taxonomy_parent_fkey FOREIGN KEY (parent_id) REFERENCES public.equipment_taxonomy(id) ON DELETE CASCADE,
+  CONSTRAINT taxonomy_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE SET NULL,
+  CONSTRAINT chk_taxonomy_name_not_empty CHECK (TRIM(name) <> ''),
+  CONSTRAINT chk_taxonomy_level CHECK (level IN ('planta', 'sistema', 'subsistema', 'componente'))
+);
+
+-- =================================================================================
+-- 3. TABLA: equipments 
+-- =================================================================================
+CREATE TABLE public.equipments (
+  id uuid DEFAULT gen_random_uuid() NOT NULL, -- Identificador único del activo físico.
+  taxonomy_id uuid NOT NULL, -- Ubicación exacta del equipo en la jerarquía (Tabla equipment_taxonomy).
+  tag_number character varying NOT NULL UNIQUE, -- Placa identificadora única del campo petrolero.
+  name character varying NOT NULL, -- Nombre descriptivo del activo (Ej: Bomba Centrífuga).
+  brand character varying, -- Empresa fabricante del equipo.
+  model character varying, -- Código de modelo estipulado por el fabricante.
+  equipment_type character varying NOT NULL, -- Familia RCM para segmentar fallas (Estatico, Rotativo, etc.).
+  operational_status character varying NOT NULL DEFAULT 'operational', -- Estatus actual para el Dashboard en tiempo real.
+  technical_specifications jsonb, -- Bloque dinámico para variables físicas de diseño (Voltaje, RPM, Material).
+  function_description text, -- Función base del equipo dentro del proceso productivo.
+  is_active boolean NOT NULL DEFAULT true, -- Permite jubilar un equipo obsoleto sin perder su historia de IA.
+  created_by uuid NOT NULL, -- ID del usuario que matriculó el equipo.
+  updated_by uuid, -- ID del usuario que hizo el último cambio en los datos del equipo.
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Cuándo ingresó al inventario digital.
+  updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Cuándo se le modificó algo por última vez.
+  
+  CONSTRAINT equipments_pkey PRIMARY KEY (id),
+  CONSTRAINT equipments_taxonomy_fkey FOREIGN KEY (taxonomy_id) REFERENCES public.equipment_taxonomy(id) ON DELETE RESTRICT,
+  CONSTRAINT equipments_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE RESTRICT,
+  CONSTRAINT equipments_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES public.users(id) ON DELETE SET NULL,
+  CONSTRAINT chk_equipments_name_not_empty CHECK (TRIM(name) <> ''),
+  CONSTRAINT chk_equipments_tag_not_empty CHECK (TRIM(tag_number) <> ''),
+  CONSTRAINT chk_equipments_type CHECK (equipment_type IN ('Estatico', 'Rotativo', 'Electrico', 'Instrumentacion')),
+  CONSTRAINT chk_equipments_status CHECK (operational_status IN ('operational', 'standby', 'under_maintenance', 'failed'))
+);
+
+-- =================================================================================
+-- 4. TABLA: equipment_metrics_history 
+-- =================================================================================
+CREATE TABLE public.equipment_metrics_history (
+  id uuid DEFAULT gen_random_uuid() NOT NULL, -- Identificador único de la lectura del sensor o manual.
+  equipment_id uuid NOT NULL, -- ID del activo evaluado.
+  temperature_celsius numeric, -- Grados Celsius registrados en la lectura.
+  vibration_mm_s numeric, -- Milímetros por segundo de vibración (vital en rotativos).
+  operating_hours numeric, -- Horas totales de uso acumuladas en el momento de la lectura.
+  specific_metrics jsonb, -- Cualquier otra métrica específica tomada (Presión, Voltaje, Flujo).
+  notes text, -- Observaciones empíricas dejadas por el técnico.
+  recorded_by uuid NOT NULL, -- ID del técnico de campo o sistema que ingresó la lectura.
+  recorded_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Fecha y hora física de la toma del dato.
+  
+  CONSTRAINT metrics_pkey PRIMARY KEY (id),
+  CONSTRAINT metrics_equipment_fkey FOREIGN KEY (equipment_id) REFERENCES public.equipments(id) ON DELETE CASCADE,
+  CONSTRAINT metrics_recorded_by_fkey FOREIGN KEY (recorded_by) REFERENCES public.users(id) ON DELETE RESTRICT,
+  CONSTRAINT chk_metrics_temp CHECK (temperature_celsius IS NULL OR (temperature_celsius BETWEEN -50 AND 1000)),
+  CONSTRAINT chk_metrics_vib CHECK (vibration_mm_s IS NULL OR vibration_mm_s >= 0)
+);
+
+-- =================================================================================
+-- 5. TABLA: fmea_analyses 
+-- =================================================================================
+CREATE TABLE public.fmea_analyses (
+  id uuid DEFAULT gen_random_uuid() NOT NULL, -- Identificador único del estudio AMFE.
+  equipment_id uuid NOT NULL, -- Activo evaluado en este documento técnico.
+  title character varying NOT NULL, -- Encabezado del estudio (Ej: Riesgo de Sobrecalentamiento).
+  status character varying NOT NULL DEFAULT 'PENDIENTE', -- Estado del análisis (Pendiente, En Análisis, Cerrado).
+  severity character varying NOT NULL, -- Gravedad del fallo (ALTA, MEDIA, BAJA).
+  frequency character varying NOT NULL, -- Probabilidad de ocurrencia (FRECUENTE, OCASIONAL, RARA).
+  detectability character varying NOT NULL, -- Qué tan fácil es darse cuenta (FÁCIL, MODERADA, DIFÍCIL).
+  description text NOT NULL, -- Resumen del comportamiento anómalo detectado.
+  causes jsonb NOT NULL DEFAULT '[]'::jsonb, -- Array JSON con las causas raíz identificadas.
+  effects jsonb NOT NULL DEFAULT '{}'::jsonb, -- Objeto JSON mapeando el impacto (Seguridad, Operacional, etc.).
+  current_controls jsonb NOT NULL DEFAULT '[]'::jsonb, -- Array JSON con las medidas defensivas vigentes.
+  recommended_actions jsonb NOT NULL DEFAULT '[]'::jsonb, -- Array JSON con pasos a seguir para mitigar la falla.
+  created_by uuid NOT NULL, -- Autor intelectual del análisis RCM.
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Fecha de apertura del estudio.
+  updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Fecha de la última edición del panel.
+  
+  CONSTRAINT fmea_pkey PRIMARY KEY (id),
+  CONSTRAINT fmea_equipment_fkey FOREIGN KEY (equipment_id) REFERENCES public.equipments(id) ON DELETE CASCADE,
+  CONSTRAINT fmea_created_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE RESTRICT,
+  CONSTRAINT chk_fmea_status CHECK (status IN ('PENDIENTE', 'EN ANÁLISIS', 'CERRADO')),
+  CONSTRAINT chk_fmea_severity CHECK (severity IN ('ALTA', 'MEDIA', 'BAJA')),
+  CONSTRAINT chk_fmea_frequency CHECK (frequency IN ('FRECUENTE', 'OCASIONAL', 'RARA')),
+  CONSTRAINT chk_fmea_detectability CHECK (detectability IN ('FÁCIL', 'MODERADA', 'DIFÍCIL'))
+);
+
+-- =================================================================================
+-- 6. TABLA: failure_history 
+-- =================================================================================
+CREATE TABLE public.failure_history (
+  id uuid DEFAULT gen_random_uuid() NOT NULL, -- ID del reporte de falla.
+  equipment_id uuid NOT NULL, -- ID del equipo averiado.
+  failure_date timestamp with time zone NOT NULL, -- Fecha y hora precisa en la que el equipo colapsó.
+  failure_mode character varying NOT NULL, -- Categoría de la falla RCM (Cortocircuito, Obstrucción).
+  severity character varying NOT NULL, -- Nivel de gravedad instantánea del evento (Critico, Alto, etc.).
+  description text NOT NULL, -- Relato de campo detallando cómo se manifestó la ruptura.
+  metric_at_failure_id uuid, -- Enlace a la lectura del sensor de la tabla 'equipment_metrics_history' al momento del fallo.
+  fmea_analysis_id uuid, -- ID del estudio FMEA que explica teóricamente este colapso.
+  downtime_hours numeric, -- Horas totales que la máquina pasó apagada (Pérdida productiva/MTTR).
+  reported_by uuid NOT NULL, -- Técnico que dio la alarma inicial.
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Cuándo se introdujo el registro al sistema.
+  
+  CONSTRAINT failures_pkey PRIMARY KEY (id),
+  CONSTRAINT failures_equipment_fkey FOREIGN KEY (equipment_id) REFERENCES public.equipments(id) ON DELETE CASCADE,
+  CONSTRAINT failures_reported_by_fkey FOREIGN KEY (reported_by) REFERENCES public.users(id) ON DELETE RESTRICT,
+  CONSTRAINT failures_metric_fkey FOREIGN KEY (metric_at_failure_id) REFERENCES public.equipment_metrics_history(id) ON DELETE RESTRICT,
+  CONSTRAINT failures_fmea_fkey FOREIGN KEY (fmea_analysis_id) REFERENCES public.fmea_analyses(id) ON DELETE SET NULL,
+  CONSTRAINT chk_failures_severity CHECK (severity IN ('Critico', 'Alto', 'Medio', 'Bajo')),
+  CONSTRAINT chk_failures_downtime CHECK (downtime_hours IS NULL OR downtime_hours >= 0)
+);
+
+-- =================================================================================
+-- 7. TABLA: maintenances 
+-- =================================================================================
+CREATE TABLE public.maintenances (
+  id uuid DEFAULT gen_random_uuid() NOT NULL, -- Identificador único del plan maestro de mantenimiento.
+  equipment_id uuid NOT NULL, -- Equipo objetivo del plan.
+  title character varying NOT NULL, -- Título estandarizado de la tarea preventiva o predictiva.
+  maintenance_type character varying NOT NULL, -- Clasificación técnica (Preventivo, Correctivo, IA).
+  description text, -- Instrucciones procedimentales detalladas.
+  frequency_days integer, -- Ciclo de repetición en días (Vacío si no es periódico).
+  is_active boolean NOT NULL DEFAULT true, -- Permite inhabilitar planes antiguos sin alterar órdenes pasadas.
+  created_by uuid NOT NULL, -- Ingeniero planificador que configuró la rutina.
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Fecha de creación del plan.
+  updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Fecha de última modificación de la frecuencia o detalles.
+  
+  CONSTRAINT maintenances_pkey PRIMARY KEY (id),
+  CONSTRAINT maintenances_equipment_fkey FOREIGN KEY (equipment_id) REFERENCES public.equipments(id) ON DELETE CASCADE,
+  CONSTRAINT maintenances_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE RESTRICT,
+  CONSTRAINT chk_maintenance_type CHECK (maintenance_type IN ('Preventivo', 'Predictivo', 'Correctivo', 'Adaptativo (IA)')),
+  CONSTRAINT chk_maintenance_frequency CHECK (frequency_days IS NULL OR frequency_days > 0)
+);
+
+-- =================================================================================
+-- 8. TABLA: work_orders 
+-- =================================================================================
+CREATE TABLE public.work_orders (
+  id uuid DEFAULT gen_random_uuid() NOT NULL, -- ID de la Orden de Trabajo operativa.
+  maintenance_id uuid NOT NULL, -- Plan maestro que justifica la existencia de esta OT.
+  assigned_to uuid, -- Técnico específico despachado para ejecutar el trabajo.
+  status character varying NOT NULL DEFAULT 'Pendiente', -- Estado en el tablero Kanban/Planner.
+  priority character varying NOT NULL DEFAULT 'Normal', -- Prioridad en la cola de asignación (Baja, Normal, Urgente).
+  scheduled_for timestamp with time zone, -- Fecha agendada esperada para la realización.
+  started_at timestamp with time zone, -- Estampa de tiempo exacta de cuando el operario inició en campo.
+  completed_at timestamp with time zone, -- Estampa de tiempo de finalización del trabajo.
+  technician_notes text, -- Comentarios finales y hallazgos anotados por el trabajador.
+  created_by uuid NOT NULL, -- Planificador o supervisor que emitió y autorizó el ticket.
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Fecha de emisión.
+  updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Último cambio de estado (Ej: de En Proceso a Terminado).
+  
+  CONSTRAINT work_orders_pkey PRIMARY KEY (id),
+  CONSTRAINT work_orders_maintenance_fkey FOREIGN KEY (maintenance_id) REFERENCES public.maintenances(id) ON DELETE CASCADE,
+  CONSTRAINT work_orders_assigned_to_fkey FOREIGN KEY (assigned_to) REFERENCES public.users(id) ON DELETE SET NULL,
+  CONSTRAINT work_orders_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE RESTRICT,
+  CONSTRAINT chk_wo_status CHECK (status IN ('Pendiente', 'En Proceso', 'Terminado', 'Cancelado')),
+  CONSTRAINT chk_wo_priority CHECK (priority IN ('Baja', 'Normal', 'Alta', 'Urgente'))
+);
+
+-- =================================================================================
+-- 9. TABLA: maintenance_history 
+-- =================================================================================
+CREATE TABLE public.maintenance_history (
+  id uuid DEFAULT gen_random_uuid() NOT NULL, -- ID del registro histórico cerrado e inmutable.
+  equipment_id uuid NOT NULL, -- Máquina sobre la cual se trabajó.
+  work_order_id uuid, -- ID de la Orden de Trabajo oficial que respalda la labor (Puede ser NULL en emergencias).
+  was_failure_driven boolean NOT NULL DEFAULT false, -- Booleano: ¿Este mantenimiento ocurrió por una rotura?
+  failure_id uuid, -- Si la anterior es TRUE, este es el ID del reporte de la falla conectada.
+  execution_date timestamp with time zone NOT NULL, -- Fecha formal en la que se entregó el equipo reparado.
+  action_taken text NOT NULL, -- Descargo técnico detallado de la compostura real ejecutada.
+  replaced_parts jsonb, -- Registro JSON de repuestos consumidos (útil para integración con inventario ERP).
+  real_downtime_hours numeric, -- Tiempo exacto total que el equipo estuvo inaccesible por el arreglo.
+  start_metric_id uuid, -- ID de la métrica tomada justo antes de iniciar la reparación (Condición de entrada).
+  end_metric_id uuid, -- ID de la métrica tomada justo al terminar la reparación (Condición de salida/éxito).
+  executed_by uuid NOT NULL, -- El trabajador que metió las manos en la máquina.
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Cuándo se guardó el registro histórico.
+  
+  CONSTRAINT maint_history_pkey PRIMARY KEY (id),
+  CONSTRAINT maint_history_equip_fkey FOREIGN KEY (equipment_id) REFERENCES public.equipments(id) ON DELETE CASCADE,
+  CONSTRAINT maint_history_wo_fkey FOREIGN KEY (work_order_id) REFERENCES public.work_orders(id) ON DELETE SET NULL,
+  CONSTRAINT maint_history_failure_fkey FOREIGN KEY (failure_id) REFERENCES public.failure_history(id) ON DELETE SET NULL,
+  CONSTRAINT maint_history_exec_fkey FOREIGN KEY (executed_by) REFERENCES public.users(id) ON DELETE RESTRICT,
+  CONSTRAINT maint_start_metric_fkey FOREIGN KEY (start_metric_id) REFERENCES public.equipment_metrics_history(id) ON DELETE RESTRICT,
+  CONSTRAINT maint_end_metric_fkey FOREIGN KEY (end_metric_id) REFERENCES public.equipment_metrics_history(id) ON DELETE RESTRICT,
+  CONSTRAINT chk_maint_hist_downtime CHECK (real_downtime_hours IS NULL OR real_downtime_hours >= 0)
+);
+
+-- =================================================================================
+-- 10. TABLA: equipment_criticality 
+-- =================================================================================
+CREATE TABLE public.equipment_criticality (
+  id uuid DEFAULT gen_random_uuid() NOT NULL, -- Identificador único de la evaluación.
+  equipment_id uuid NOT NULL UNIQUE, -- Activo evaluado (Relación 1:1, un equipo tiene una criticidad).
+  safety_impact_score integer NOT NULL, -- Puntuación de impacto en la integridad humana si el equipo falla.
+  environmental_impact_score integer NOT NULL, -- Puntuación de impacto por derrame o contaminación.
+  operational_impact_score integer NOT NULL, -- Puntuación de impacto en la parada de producción petrolera.
+  maintenance_cost_score integer NOT NULL, -- Puntuación de impacto económico al reparar.
+  rpn_score integer NOT NULL, -- Risk Priority Number (Valor consolidado del riesgo).
+  criticality_level character varying NOT NULL, -- Clasificación final humana o del sistema (Alta, Media, Baja).
+  evaluated_by uuid NOT NULL, -- Analista de confiabilidad que corrió la matriz.
+  evaluated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Fecha de la última evaluación de riesgo.
+  
+  CONSTRAINT criticality_pkey PRIMARY KEY (id),
+  CONSTRAINT criticality_equipment_fkey FOREIGN KEY (equipment_id) REFERENCES public.equipments(id) ON DELETE CASCADE,
+  CONSTRAINT criticality_evaluated_fkey FOREIGN KEY (evaluated_by) REFERENCES public.users(id) ON DELETE RESTRICT,
+  CONSTRAINT chk_criticality_level CHECK (criticality_level IN ('Alta', 'Media', 'Baja'))
+);
+
+-- =================================================================================
+-- 11. TABLA: ai_recommendations (Salida de la IA)
+-- =================================================================================
+CREATE TABLE public.ai_recommendations (
+  id uuid DEFAULT gen_random_uuid() NOT NULL, -- ID único del output del motor IA.
+  equipment_id uuid NOT NULL, -- Equipo sobre el cual el algoritmo generó la inferencia.
+  trigger_source character varying NOT NULL, -- Evento disparador (Anomalía en métrica, Patrón de fallas).
+  trigger_reference_id uuid, -- ID externo de lo que gatilló a la IA (Ej: El ID de la métrica anómala).
+  recommendation_text text NOT NULL, -- La sugerencia en lenguaje natural generada por el modelo.
+  confidence_score numeric NOT NULL, -- Índice porcentual (0-100) de certeza predictiva interna de la IA.
+  prediction_type character varying NOT NULL, -- Categoría del consejo (Ajuste de Frecuencia, Alerta de Falla Inminente).
+  status character varying NOT NULL DEFAULT 'Pendiente', -- Flujo de validación (Pendiente, Aceptada, Rechazada).
+  resolved_by uuid, -- Ingeniero de Confiabilidad que validó el resultado de la IA.
+  resolved_at timestamp with time zone, -- Fecha en la que el ingeniero tomó la decisión.
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Cuándo emitió la alerta el servidor IA.
+  
+  CONSTRAINT ai_recs_pkey PRIMARY KEY (id),
+  CONSTRAINT ai_recs_equipment_fkey FOREIGN KEY (equipment_id) REFERENCES public.equipments(id) ON DELETE CASCADE,
+  CONSTRAINT ai_recs_resolved_fkey FOREIGN KEY (resolved_by) REFERENCES public.users(id) ON DELETE SET NULL,
+  CONSTRAINT chk_ai_confidence CHECK (confidence_score >= 0 AND confidence_score <= 100),
+  CONSTRAINT chk_ai_status CHECK (status IN ('Pendiente', 'Aceptada', 'Rechazada'))
+);
+
+-- =================================================================================
+-- 12. TABLA: ai_corrections (Bucle de Aprendizaje Reforzado)
+-- DESCRIPCIÓN: Almacena la retroalimentación técnica exacta cuando un ingeniero 
+-- RCM rechaza una recomendación. Esto permite que el modelo adaptativo se reentrene.
+-- =================================================================================
+CREATE TABLE public.ai_corrections (
+  id uuid DEFAULT gen_random_uuid() NOT NULL, -- ID único del ticket de corrección.
+  recommendation_id uuid NOT NULL UNIQUE, -- Vinculado 1:1 a la recomendación específica de la IA que falló.
+  corrected_text text NOT NULL, -- La instrucción humana real ("Se debe ajustar a 120 días, no a 90...").
+  corrected_by uuid NOT NULL, -- Autoridad (Ingeniero RCM) que dictó la corrección pedagógica para el modelo.
+  created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP, -- Momento en el que se generó la corrección.
+  
+  CONSTRAINT ai_corrections_pkey PRIMARY KEY (id),
+  CONSTRAINT ai_corrections_rec_fkey FOREIGN KEY (recommendation_id) REFERENCES public.ai_recommendations(id) ON DELETE CASCADE,
+  CONSTRAINT ai_corrections_user_fkey FOREIGN KEY (corrected_by) REFERENCES public.users(id) ON DELETE RESTRICT
+);
+
+-- =================================================================================
+-- ÍNDICES DE RENDIMIENTO GLOBALES
+-- =================================================================================
+CREATE INDEX idx_equipments_tag ON public.equipments (tag_number);
+CREATE INDEX idx_equipments_status ON public.equipments (operational_status);
+CREATE INDEX idx_wo_status ON public.work_orders (status);
+CREATE INDEX idx_wo_assigned ON public.work_orders (assigned_to);
+CREATE INDEX idx_metrics_date ON public.equipment_metrics_history (recorded_at);
+CREATE INDEX idx_maint_hist_equip ON public.maintenance_history (equipment_id);
+CREATE INDEX idx_fmea_equipment ON public.fmea_analyses (equipment_id);
+CREATdddE INDEX idx_fmea_status ON public.fmea_analyses (status);
+CREATE INDEX idx_ai_recs_equipment ON public.ai_recommendations (equipment_id);
+CREATE INDEX idx_ai_recs_status ON public.ai_recommendations (status);
+
+
+
+quiero desarrollar ahora las tablas 
+failure_history
+
+ademas quiero rehacer equipment_metrics_history por que solo le tengo dos rutas pero creo que debe tener post y varios get como por equipo, fecha y asi en gneera todos los historiales deben tener eso 
+
+
+veamos todo debe tener 
+post de creacion
+get all
+get id 
+get (email o variable clave de la tabla como equipo nombre o creado por id de usuario o nombre de usuario de este haz los que sean necearios en cada tabla )
+patch si es necesario
+y softdelete si es necesario
+y no se si falte algo cualquier cosa lo pones 
+
+ademas deben estar correctamente aprueba d efallas como tipeo o falta de datos y cosas asi 
+
+ademas debe seguir la estrcutura que se uso en users incluyendo como se documento como proyecto profesional 
+
