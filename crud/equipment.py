@@ -5,8 +5,8 @@ Módulo CRUD para los equipos/activos.
 import uuid
 from typing import List, Optional
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
 
 from models.equipment import Equipment
 
@@ -20,23 +20,34 @@ async def create_equipment(db: AsyncSession, obj_in: dict) -> Equipment:
 
 
 async def get_equipment_by_id(db: AsyncSession, equipment_id: uuid.UUID) -> Optional[Equipment]:
-    result = await db.execute(select(Equipment).where(Equipment.id == equipment_id))
+    result = await db.execute(
+        select(Equipment).where(Equipment.id == equipment_id, Equipment.is_active.is_(True))
+    )
     return result.scalars().first()
 
 
 async def get_equipment_by_tag_number(db: AsyncSession, tag_number: str) -> Optional[Equipment]:
+    """Busca tags actualmente asignados."""
     result = await db.execute(select(Equipment).where(Equipment.tag_number == tag_number))
     return result.scalars().first()
 
 
 async def get_equipments(db: AsyncSession, skip: int = 0, limit: int = 100) -> List[Equipment]:
-    result = await db.execute(select(Equipment).order_by(Equipment.name).offset(skip).limit(limit))
+    result = await db.execute(
+        select(Equipment)
+        .where(Equipment.is_active.is_(True))
+        .order_by(Equipment.name)
+        .offset(skip)
+        .limit(limit)
+    )
     return list(result.scalars().all())
 
 
 async def get_equipments_by_taxonomy(db: AsyncSession, taxonomy_id: uuid.UUID) -> List[Equipment]:
     result = await db.execute(
-        select(Equipment).where(Equipment.taxonomy_id == taxonomy_id).order_by(Equipment.name)
+        select(Equipment)
+        .where(Equipment.taxonomy_id == taxonomy_id, Equipment.is_active.is_(True))
+        .order_by(Equipment.name)
     )
     return list(result.scalars().all())
 

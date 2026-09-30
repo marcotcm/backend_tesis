@@ -13,6 +13,12 @@ from schemas.equipment import EquipmentCreate, EquipmentUpdate
 
 
 async def create_equipment(db: AsyncSession, equipment_in: EquipmentCreate) -> dict:
+    """
+    Registra un equipo y valida sus relaciones principales.
+
+    Comprueba que la taxonomía exista, evita duplicar el tag del activo
+    y delega la persistencia al módulo CRUD.
+    """
     taxonomy = await crud_taxonomy.get_taxonomy_by_id(db, equipment_in.taxonomy_id)
     if not taxonomy:
         raise HTTPException(
@@ -32,6 +38,7 @@ async def create_equipment(db: AsyncSession, equipment_in: EquipmentCreate) -> d
 
 
 async def get_equipment_or_404(db: AsyncSession, equipment_id: uuid.UUID):
+    """Obtiene un equipo por UUID o devuelve un error HTTP 404."""
     equipment = await crud_equipment.get_equipment_by_id(db, equipment_id)
     if not equipment:
         raise HTTPException(
@@ -42,10 +49,17 @@ async def get_equipment_or_404(db: AsyncSession, equipment_id: uuid.UUID):
 
 
 async def list_equipments(db: AsyncSession, skip: int = 0, limit: int = 100):
+    """Devuelve una lista paginada de equipos registrados."""
     return await crud_equipment.get_equipments(db=db, skip=skip, limit=limit)
 
 
 async def update_equipment(db: AsyncSession, equipment_id: uuid.UUID, equipment_in: EquipmentUpdate):
+    """
+    Actualiza parcialmente un equipo.
+
+    Valida la nueva taxonomía y evita que el tag actualizado
+    quede duplicado en otro equipo.
+    """
     equipment = await get_equipment_or_404(db, equipment_id)
     update_data = equipment_in.model_dump(exclude_unset=True)
 
@@ -69,5 +83,6 @@ async def update_equipment(db: AsyncSession, equipment_id: uuid.UUID, equipment_
 
 
 async def deactivate_equipment(db: AsyncSession, equipment_id: uuid.UUID):
+    """Desactiva lógicamente un equipo sin eliminar su registro histórico."""
     equipment = await get_equipment_or_404(db, equipment_id)
     return await crud_equipment.deactivate_equipment(db, equipment)

@@ -13,6 +13,12 @@ from schemas.maintenance import MaintenanceCreate, MaintenanceUpdate
 
 
 async def create_maintenance(db: AsyncSession, maintenance_in: MaintenanceCreate):
+    """
+    Registra un plan de mantenimiento asociado a un equipo existente.
+
+    La función valida la relación con el equipo antes de delegar
+    la inserción al CRUD de mantenimientos.
+    """
     equipment = await crud_equipment.get_equipment_by_id(db, maintenance_in.equipment_id)
     if not equipment:
         raise HTTPException(
@@ -25,6 +31,7 @@ async def create_maintenance(db: AsyncSession, maintenance_in: MaintenanceCreate
 
 
 async def get_maintenance_or_404(db: AsyncSession, maintenance_id: uuid.UUID):
+    """Obtiene un mantenimiento por UUID o devuelve un error HTTP 404."""
     maintenance = await crud_maintenance.get_maintenance_by_id(db, maintenance_id)
     if not maintenance:
         raise HTTPException(
@@ -35,10 +42,16 @@ async def get_maintenance_or_404(db: AsyncSession, maintenance_id: uuid.UUID):
 
 
 async def list_maintenances(db: AsyncSession, skip: int = 0, limit: int = 100):
+    """Devuelve una lista paginada de planes de mantenimiento."""
     return await crud_maintenance.get_maintenances(db=db, skip=skip, limit=limit)
 
 
 async def update_maintenance(db: AsyncSession, maintenance_id: uuid.UUID, maintenance_in: MaintenanceUpdate):
+    """
+    Actualiza parcialmente un plan de mantenimiento.
+
+    Si cambia el equipo asociado, valida que el nuevo equipo exista.
+    """
     maintenance = await get_maintenance_or_404(db, maintenance_id)
     update_data = maintenance_in.model_dump(exclude_unset=True)
 
@@ -54,5 +67,6 @@ async def update_maintenance(db: AsyncSession, maintenance_id: uuid.UUID, mainte
 
 
 async def deactivate_maintenance(db: AsyncSession, maintenance_id: uuid.UUID):
+    """Desactiva lógicamente un plan de mantenimiento."""
     maintenance = await get_maintenance_or_404(db, maintenance_id)
     return await crud_maintenance.deactivate_maintenance(db, maintenance)

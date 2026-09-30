@@ -5,8 +5,8 @@ Módulo CRUD para los mantenimientos.
 import uuid
 from typing import List, Optional
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
 
 from models.maintenance import Maintenance
 
@@ -20,18 +20,28 @@ async def create_maintenance(db: AsyncSession, obj_in: dict) -> Maintenance:
 
 
 async def get_maintenance_by_id(db: AsyncSession, maintenance_id: uuid.UUID) -> Optional[Maintenance]:
-    result = await db.execute(select(Maintenance).where(Maintenance.id == maintenance_id))
+    result = await db.execute(
+        select(Maintenance).where(Maintenance.id == maintenance_id, Maintenance.is_active.is_(True))
+    )
     return result.scalars().first()
 
 
 async def get_maintenances(db: AsyncSession, skip: int = 0, limit: int = 100) -> List[Maintenance]:
-    result = await db.execute(select(Maintenance).order_by(Maintenance.created_at.desc()).offset(skip).limit(limit))
+    result = await db.execute(
+        select(Maintenance)
+        .where(Maintenance.is_active.is_(True))
+        .order_by(Maintenance.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
     return list(result.scalars().all())
 
 
 async def get_maintenances_by_equipment(db: AsyncSession, equipment_id: uuid.UUID) -> List[Maintenance]:
     result = await db.execute(
-        select(Maintenance).where(Maintenance.equipment_id == equipment_id).order_by(Maintenance.created_at.desc())
+        select(Maintenance)
+        .where(Maintenance.equipment_id == equipment_id, Maintenance.is_active.is_(True))
+        .order_by(Maintenance.created_at.desc())
     )
     return list(result.scalars().all())
 
