@@ -7,7 +7,7 @@ gestionando la interacción con Supabase Auth y la base de datos local.
 
 import uuid
 from typing import List
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, status, Header, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from supabase import Client
 from pydantic import EmailStr
@@ -23,7 +23,8 @@ from schemas.user import (
     UserLogin, 
     TokenResponse, 
     TokenRefreshRequest, 
-    ForgotPasswordRequest
+    ForgotPasswordRequest,
+    PasswordUpdate
 )
 from services import user as user_service
 from crud import user as crud_user
@@ -91,6 +92,30 @@ async def recuperar_contrasena(
     * **Resultado:** Dispara un correo con enlace seguro de restablecimiento de contraseña gestionado por Supabase Auth.
     """
     return await user_service.request_password_reset(email=payload.email, supabase_client=supabase_client)
+
+
+@router.post("/actualizar-contrasena", status_code=status.HTTP_200_OK)
+async def actualizar_contrasena(
+    payload: PasswordUpdate,
+    authorization: str = Header(..., description="Bearer token de recuperación capturado en el frontend")
+):
+    """
+    * **Ruta:** POST /api/v1/usuarios/actualizar-contrasena
+    * **Token:** Requiere (Bearer token temporal enviado en el Header Authorization)
+    * **Nivel de permiso:** Público (Usuario en flujo de recuperación con token válido)
+    * **Uso:** Recibe la nueva contraseña y el token temporal extraído de la URL del frontend.
+    * **Resultado:** Establece sesión temporal, actualiza la contraseña en Supabase Auth y cierra el flujo.
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Formato de token inválido. Usa 'Bearer <token>'"
+        )
+    
+    # Extrae solo el token de la cadena "Bearer xyz..."
+    token = authorization.split(" ")[1]
+    
+    return await user_service.update_user_password_with_token(token=token, new_password=payload.new_password)
 
 
 @router.get("/me", response_model=UserResponse, status_code=status.HTTP_200_OK)

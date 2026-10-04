@@ -5,12 +5,13 @@ Coordina las operaciones entre Supabase Auth y PostgreSQL garantizando
 atomicidad (rollback en el proveedor de identidad si falla la persistencia local).
 """
 
+import os
 import uuid
 import traceback
 from typing import Optional
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from supabase import Client
+from supabase import Client, create_client
 from supabase_auth.errors import AuthApiError
 from pydantic import EmailStr
 
@@ -126,10 +127,14 @@ async def refresh_session(db: AsyncSession, refresh_token: str, supabase_client:
 async def request_password_reset(email: EmailStr, supabase_client: Client) -> dict:
     """Envía el correo de restablecimiento de contraseña mediante el proveedor de Auth."""
     try:
-        supabase_client.auth.reset_password_for_email(email)
+        reset_options = {
+            "redirect_to": "https://heimdall-rcm.vercel.app/auth/recover-password"
+        }
+        
+        supabase_client.auth.reset_password_for_email(email, reset_options)
+        
         return {"detail": "Si el correo existe en la plataforma, se ha enviado el enlace de restablecimiento."}
     except AuthApiError as e:
-        # Captura errores específicos de validación de Supabase Auth
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, 
             detail=f"Error en el servicio de correo de autenticación: {e.message}"
@@ -139,6 +144,43 @@ async def request_password_reset(email: EmailStr, supabase_client: Client) -> di
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail="Error interno al procesar la solicitud de recuperación."
+        )
+
+async def update_user_password_with_token(token: str, new_password: str) -> dict:
+    """
+    Actualiza la contraseña validando el token temporal provisto por el enlace de correo.
+    Utiliza un cliente de Supabase aislado para evitar corromper la sesión global de la API.
+    """
+    try:
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_ANON_KEY")
+        
+        if not supabase_url or not supabase_key:
+            raise ValueError("Las credenciales de Supabase no están configuradas en el entorno.")
+            
+        # Crear cliente temporal para aislar la sesión de esta solicitud
+        temp_client = create_client(supabase_url, supabase_key)
+        
+        # Establecer la sesión con el token que el usuario extrajo de la URL en el frontend
+        temp_client.auth.set_session({"access_token": token, "refresh_token": ""})
+        
+        # Ejecutar la actualización de la contraseña (actúa sobre el usuario logueado en la sesión temporal)
+        temp_client.auth.update_user({
+            "password": new_password
+        })
+        
+        return {"detail": "Contraseña actualizada exitosamente."}
+        
+    except AuthApiError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Error al actualizar contraseña: {e.message}"
+        )
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error interno procesando el cambio de contraseña."
         )
 
 async def get_user_or_404(db: AsyncSession, user_id: uuid.UUID) -> User:

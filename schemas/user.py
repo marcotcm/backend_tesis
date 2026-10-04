@@ -9,7 +9,7 @@ import re
 import uuid
 from datetime import date, datetime
 from typing import Optional
-from pydantic import BaseModel, EmailStr, field_validator
+from pydantic import BaseModel, EmailStr, field_validator, Field
 from models.user import UserRole, Turn
 
 class UserBase(BaseModel):
@@ -104,3 +104,7 @@ class TokenResponse(BaseModel):
 class ForgotPasswordRequest(BaseModel):
     """Cuerpo de solicitud para iniciar el proceso de recuperación de contraseña."""
     email: EmailStr
+
+class PasswordUpdate(BaseModel):
+    """Cuerpo de solicitud para actualizar la contraseña utilizando un token de recuperación."""
+    new_password: str = Field(..., min_length=6, description="La nueva contraseña segura para el usuario")
