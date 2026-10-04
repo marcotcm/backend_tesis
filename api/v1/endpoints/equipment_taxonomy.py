@@ -21,7 +21,6 @@ from services import equipment_taxonomy as taxonomy_service
 
 router = APIRouter()
 
-
 @router.post(
     "/",
     response_model=EquipmentTaxonomyResponse,
@@ -112,7 +111,8 @@ async def actualizar_taxonomia(
 
 @router.delete(
     "/{id}",
-    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=EquipmentTaxonomyResponse,
+    status_code=status.HTTP_200_OK,
     summary="Eliminar categoría de taxonomía",
 )
 async def eliminar_taxonomia(
@@ -121,6 +121,10 @@ async def eliminar_taxonomia(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Elimina una categoría únicamente cuando no tiene equipos ni subcategorías asociadas.
+    * **Ruta:** DELETE /api/v1/taxonomia/{id}
+    * **Token:** Requiere (Bearer JWT).
+    * **Nivel de permiso:** Usuario Autenticado.
+    * **Uso:** Elimina una categoría únicamente cuando no tiene equipos ni subcategorías asociadas.
+    * **Resultado:** Aplica baja lógica al registro marcando `deleted_at`.
     """
-    await taxonomy_service.delete_taxonomy(db=db, taxonomy_id=id)
+    return await taxonomy_service.delete_taxonomy(db=db, taxonomy_id=id)

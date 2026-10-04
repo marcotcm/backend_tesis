@@ -63,4 +63,4 @@ async def delete_taxonomy(db: AsyncSession, taxonomy_id: uuid.UUID):
             status_code=status.HTTP_409_CONFLICT,
             detail="No se puede eliminar la taxonomía porque tiene equipos o subcategorías asociadas."
         )
-    await crud_taxonomy.delete_taxonomy(db, taxonomy)
+    return await crud_taxonomy.delete_taxonomy(db, taxonomy)

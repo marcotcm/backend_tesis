@@ -11,11 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from db.session import get_db
 from core.security import get_current_user
 from models.user import User
-from schemas.equipment import EquipmentCreate, EquipmentResponse, EquipmentUpdate
+from schemas.equipment import EquipmentCreate, EquipmentResponse, EquipmentUpdate, UsageTimeUpdate
 from services import equipment as equipment_service
 
 router = APIRouter()
-
 
 @router.post(
     "/",
@@ -36,7 +35,6 @@ async def crear_equipo(
     * **Resultado:** Crea el equipo si la taxonomía existe y el tag no está duplicado.
     """
     return await equipment_service.create_equipment(db=db, equipment_in=equipment_in, user_id=current_user.id)
-
 
 @router.get(
     "/",
@@ -63,7 +61,6 @@ async def listar_equipos(
         return await crud_equipment.get_equipments_by_taxonomy(db=db, taxonomy_id=taxonomy_id)
     return await equipment_service.list_equipments(db=db, skip=skip, limit=limit)
 
-
 @router.get(
     "/{id}",
     response_model=EquipmentResponse,
@@ -83,7 +80,6 @@ async def obtener_equipo(
     * **Resultado:** Retorna el equipo solicitado o un error 404 si no existe.
     """
     return await equipment_service.get_equipment_or_404(db=db, equipment_id=id)
-
 
 @router.patch(
     "/{id}",
@@ -106,6 +102,26 @@ async def actualizar_equipo(
     """
     return await equipment_service.update_equipment(db=db, equipment_id=id, equipment_in=equipment_in, user_id=current_user.id)
 
+@router.patch(
+    "/{id}/tiempo-uso",
+    response_model=EquipmentResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Gestionar tiempo de uso",
+)
+async def actualizar_tiempo_uso(
+    id: uuid.UUID,
+    usage_in: UsageTimeUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    * **Ruta:** PATCH /api/v1/equipos/{id}/tiempo-uso
+    * **Token:** Requiere (Bearer JWT).
+    * **Nivel de permiso:** Usuario Autenticado.
+    * **Uso:** Suma, resta o sobrescribe los minutos de uso de un equipo específico.
+    * **operation:** Puede ser `add` (sumar), `subtract` (restar) o `set` (reemplazar).
+    """
+    return await equipment_service.update_equipment_usage_time(db=db, equipment_id=id, usage_in=usage_in, user_id=current_user.id)
 
 @router.delete(
     "/{id}",

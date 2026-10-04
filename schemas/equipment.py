@@ -1,7 +1,11 @@
+"""
+Esquemas Pydantic para los activos/equipos.
+"""
+
 import uuid
 from datetime import datetime
 from typing import Any, Literal, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 class EquipmentBase(BaseModel):
     taxonomy_id: uuid.UUID
@@ -28,14 +32,22 @@ class EquipmentUpdate(BaseModel):
     operational_status: Optional[Literal["operational", "standby", "under_maintenance", "failed"]] = None
     technical_specifications: Optional[dict[str, Any]] = None
     function_description: Optional[str] = None
+    usage_time: Optional[int] = None
     is_active: Optional[bool] = None
+
+class UsageTimeUpdate(BaseModel):
+    """Esquema específico para modificar los minutos de uso."""
+    operation: Literal["add", "subtract", "set"]
+    minutes: int = Field(..., ge=0, description="Cantidad de minutos a sumar, restar o establecer")
 
 class EquipmentResponse(EquipmentBase):
     id: uuid.UUID
+    usage_time: Optional[int] = None
     created_by: uuid.UUID
     updated_by: Optional[uuid.UUID] = None
     created_at: datetime
     updated_at: datetime
+    deleted_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

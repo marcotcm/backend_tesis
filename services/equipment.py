@@ -7,7 +7,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from crud import equipment as crud_equipment
 from crud import equipment_taxonomy as crud_taxonomy
-from schemas.equipment import EquipmentCreate, EquipmentUpdate
+from schemas.equipment import EquipmentCreate, EquipmentUpdate, UsageTimeUpdate
 
 async def create_equipment(db: AsyncSession, equipment_in: EquipmentCreate, user_id: uuid.UUID) -> dict:
     """
@@ -58,6 +58,28 @@ async def update_equipment(db: AsyncSession, equipment_id: uuid.UUID, equipment_
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El número de tag ya se encuentra asignado a otro equipo.")
 
     update_data["updated_by"] = user_id
+    return await crud_equipment.update_equipment(db, equipment, update_data)
+
+async def update_equipment_usage_time(db: AsyncSession, equipment_id: uuid.UUID, usage_in: UsageTimeUpdate, user_id: uuid.UUID):
+    """
+    Gestiona dinámicamente los minutos de uso sumando, restando o sobrescribiendo.
+    """
+    equipment = await get_equipment_or_404(db, equipment_id)
+    
+    current_time = equipment.usage_time or 0
+    new_time = current_time
+
+    if usage_in.operation == "add":
+        new_time += usage_in.minutes
+    elif usage_in.operation == "subtract":
+        new_time = max(0, current_time - usage_in.minutes)
+    elif usage_in.operation == "set":
+        new_time = usage_in.minutes
+
+    update_data = {
+        "usage_time": new_time,
+        "updated_by": user_id
+    }
     return await crud_equipment.update_equipment(db, equipment, update_data)
 
 async def deactivate_equipment(db: AsyncSession, equipment_id: uuid.UUID):
