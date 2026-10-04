@@ -1,5 +1,5 @@
 """
-Módulo CRUD para los equipos/activos.
+Módulo CRUD para la taxonomía de equipos.
 """
 
 import uuid
@@ -9,50 +9,60 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.equipment import Equipment
+from models.equipment_taxonomy import EquipmentTaxonomy
 
-
-async def create_equipment(db: AsyncSession, obj_in: dict) -> Equipment:
-    db_obj = Equipment(**obj_in)
+async def create_taxonomy(db: AsyncSession, obj_in: dict) -> EquipmentTaxonomy:
+    db_obj = EquipmentTaxonomy(**obj_in)
     db.add(db_obj)
     await db.commit()
     await db.refresh(db_obj)
     return db_obj
 
-
-async def get_equipment_by_id(db: AsyncSession, equipment_id: uuid.UUID) -> Optional[Equipment]:
+async def get_taxonomy_by_id(db: AsyncSession, taxonomy_id: uuid.UUID) -> Optional[EquipmentTaxonomy]:
     result = await db.execute(
-        select(Equipment).where(Equipment.id == equipment_id, Equipment.is_active.is_(True))
+        select(EquipmentTaxonomy).where(
+            EquipmentTaxonomy.id == taxonomy_id,
+        )
     )
     return result.scalars().first()
 
-
-async def get_equipment_by_tag_number(db: AsyncSession, tag_number: str) -> Optional[Equipment]:
-    """Busca tags actualmente asignados."""
-    result = await db.execute(select(Equipment).where(Equipment.tag_number == tag_number))
-    return result.scalars().first()
-
-
-async def get_equipments(db: AsyncSession, skip: int = 0, limit: int = 100) -> List[Equipment]:
+async def get_taxonomies(db: AsyncSession, skip: int = 0, limit: int = 100) -> List[EquipmentTaxonomy]:
     result = await db.execute(
-        select(Equipment)
-        .where(Equipment.is_active.is_(True))
-        .order_by(Equipment.name)
+        select(EquipmentTaxonomy)
+        .order_by(EquipmentTaxonomy.level)
         .offset(skip)
         .limit(limit)
     )
     return list(result.scalars().all())
 
-
-async def get_equipments_by_taxonomy(db: AsyncSession, taxonomy_id: uuid.UUID) -> List[Equipment]:
-    result = await db.execute(
-        select(Equipment)
-        .where(Equipment.taxonomy_id == taxonomy_id, Equipment.is_active.is_(True))
-        .order_by(Equipment.name)
-    )
+async def get_taxonomies_by_parent(db: AsyncSession, parent_id: Optional[uuid.UUID]) -> List[EquipmentTaxonomy]:
+    if parent_id is None:
+        result = await db.execute(
+            select(EquipmentTaxonomy)
+            .where(EquipmentTaxonomy.parent_id.is_(None))
+            .order_by(EquipmentTaxonomy.name)
+        )
+    else:
+        result = await db.execute(
+            select(EquipmentTaxonomy)
+            .where(EquipmentTaxonomy.parent_id == parent_id)
+            .order_by(EquipmentTaxonomy.name)
+        )
     return list(result.scalars().all())
 
+async def has_children(db: AsyncSession, taxonomy_id: uuid.UUID) -> bool:
+    result = await db.execute(
+        select(EquipmentTaxonomy.id).where(EquipmentTaxonomy.parent_id == taxonomy_id).limit(1)
+    )
+    return result.scalar_one_or_none() is not None
 
-async def update_equipment(db: AsyncSession, db_obj: Equipment, update_data: dict) -> Equipment:
+async def has_equipments(db: AsyncSession, taxonomy_id: uuid.UUID) -> bool:
+    result = await db.execute(
+        select(Equipment.id).where(Equipment.taxonomy_id == taxonomy_id).limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+async def update_taxonomy(db: AsyncSession, db_obj: EquipmentTaxonomy, update_data: dict) -> EquipmentTaxonomy:
     for field, value in update_data.items():
         if hasattr(db_obj, field):
             setattr(db_obj, field, value)
@@ -61,9 +71,6 @@ async def update_equipment(db: AsyncSession, db_obj: Equipment, update_data: dic
     await db.refresh(db_obj)
     return db_obj
 
-
-async def deactivate_equipment(db: AsyncSession, db_obj: Equipment) -> Equipment:
-    db_obj.is_active = False
+async def delete_taxonomy(db: AsyncSession, db_obj: EquipmentTaxonomy) -> None:
+    await db.delete(db_obj)
     await db.commit()
-    await db.refresh(db_obj)
-    return db_obj
