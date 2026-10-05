@@ -8,6 +8,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel
 
 class EquipmentTaxonomyBase(BaseModel):
+    parent_id: Optional[uuid.UUID] = None
     name: str
     level: Literal["planta", "sistema", "subsistema", "componente"]
     description: Optional[str] = None
