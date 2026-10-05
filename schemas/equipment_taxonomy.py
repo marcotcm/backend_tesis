@@ -8,11 +8,10 @@ from typing import Literal, Optional
 from pydantic import BaseModel
 
 class EquipmentTaxonomyBase(BaseModel):
-    parent_id: Optional[uuid.UUID] = None
     name: str
     level: Literal["planta", "sistema", "subsistema", "componente"]
     description: Optional[str] = None
-    is_active: bool = True
+    
 
 class EquipmentTaxonomyCreate(EquipmentTaxonomyBase):
     pass
@@ -26,6 +25,7 @@ class EquipmentTaxonomyUpdate(BaseModel):
 
 class EquipmentTaxonomyResponse(EquipmentTaxonomyBase):
     id: uuid.UUID
+    is_active: bool 
     created_by: Optional[uuid.UUID] = None
     created_at: datetime
     deleted_at: Optional[datetime] = None
