@@ -77,7 +77,6 @@ async def update_taxonomy(db: AsyncSession, db_obj: EquipmentTaxonomy, update_da
 
 async def delete_taxonomy(db: AsyncSession, db_obj: EquipmentTaxonomy) -> EquipmentTaxonomy:
     """Aplica soft delete al registro de taxonomía."""
-    db_obj.is_active = False
     db_obj.deleted_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(db_obj)

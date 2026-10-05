@@ -22,7 +22,6 @@ class EquipmentTaxonomy(Base):
     level = Column(String, nullable=False)
     
     description = Column(Text, nullable=True)
-    is_active = Column(Boolean, nullable=False, default=True)
     created_by = Column(UUID(as_uuid=True), ForeignKey("public.users.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     
