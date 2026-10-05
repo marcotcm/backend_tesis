@@ -22,7 +22,6 @@ class EquipmentTaxonomyUpdate(BaseModel):
     name: Optional[str] = None
     level: Optional[Literal["planta", "sistema", "subsistema", "componente"]] = None
     description: Optional[str] = None
-    is_active: Optional[bool] = None
 
 class EquipmentTaxonomyResponse(EquipmentTaxonomyBase):
     id: uuid.UUID
