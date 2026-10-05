@@ -131,7 +131,7 @@ async def request_password_reset(email: EmailStr, supabase_client: Client) -> di
             "redirect_to": "https://heimdall-rcm.vercel.app/auth/recover-password"
         }
         
-        supabase_client.auth.reset_password_for_email(email, reset_options)
+          supabase_client.auth.reset_password_for_email(email, options=reset_options)
         
         return {"detail": "Si el correo existe en la plataforma, se ha enviado el enlace de restablecimiento."}
     except AuthApiError as e:
