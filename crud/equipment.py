@@ -7,6 +7,7 @@ from typing import List, Optional
 from datetime import datetime, timezone
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.equipment import Equipment
@@ -48,6 +49,40 @@ async def get_equipments_by_taxonomy(db: AsyncSession, taxonomy_id: uuid.UUID) -
         .order_by(Equipment.name)
     )
     return list(result.scalars().all())
+
+async def get_all_equipments_by_taxonomy(
+    db: AsyncSession, taxonomy_id: uuid.UUID
+) -> List[Equipment]:
+    """Obtiene todos los equipos de una taxonomía, incluidos los dados de baja."""
+    result = await db.execute(
+        select(Equipment)
+        .where(Equipment.taxonomy_id == taxonomy_id)
+        .order_by(Equipment.tag_number)
+    )
+    return list(result.scalars().all())
+
+async def get_existing_equipment_tags(
+    db: AsyncSession, tag_numbers: list[str]
+) -> set[str]:
+    if not tag_numbers:
+        return set()
+    result = await db.execute(
+        select(Equipment.tag_number).where(Equipment.tag_number.in_(tag_numbers))
+    )
+    return set(result.scalars().all())
+
+async def create_equipments_bulk(
+    db: AsyncSession, records: list[dict]
+) -> list[Equipment]:
+    objects = [Equipment(**record) for record in records]
+    try:
+        db.add_all(objects)
+        await db.flush()
+        await db.commit()
+    except SQLAlchemyError:
+        await db.rollback()
+        raise
+    return objects
 
 async def update_equipment(db: AsyncSession, db_obj: Equipment, update_data: dict) -> Equipment:
     for field, value in update_data.items():
