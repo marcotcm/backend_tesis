@@ -8,7 +8,7 @@ gestionando la interacción con la base de datos local para la telemetría de eq
 import uuid
 from typing import List, Optional
 from datetime import datetime
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.session import get_db
@@ -22,6 +22,7 @@ router = APIRouter()
 @router.post("/", response_model=EquipmentMetricResponse, status_code=status.HTTP_201_CREATED)
 async def registrar_metrica(
     metric_in: EquipmentMetricCreate,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -32,7 +33,7 @@ async def registrar_metrica(
     * **Uso:** Recibe variables de condición operativa (Temperatura, Vibración, horas, etc.) para un equipo.
     * **Resultado:** Registra la lectura en la base de datos, asociando irrevocablemente el ID del técnico en sesión como autor de la medición.
     """
-    return await metrics_service.record_metric(db=db, metric_in=metric_in, current_user=current_user)
+    return await metrics_service.record_metric(db=db, metric_in=metric_in, current_user=current_user, background_tasks=background_tasks )
 
 @router.get("/", response_model=List[EquipmentMetricResponse], status_code=status.HTTP_200_OK)
 async def listar_metricas_globales(
