@@ -13,15 +13,10 @@ from sqlalchemy import Column, String, Numeric, Text, ForeignKey, DateTime
 from sqlalchemy.dialects.postgresql import UUID, ENUM
 from db.session import Base
 
-class FailureSeverity(str, enum.Enum):
-    """Niveles de gravedad de la falla según la matriz de criticidad."""
-    critico = "Critico"
-    alto = "Alto"
-    medio = "Medio"
-    bajo = "Bajo"
+
 
 # Enum nativo de PostgreSQL
-severity_enum = ENUM(FailureSeverity, name="failure_severity", schema="public", create_type=False)
+
 
 class FailureHistory(Base):
     __tablename__ = "failure_history"
@@ -32,7 +27,7 @@ class FailureHistory(Base):
     
     failure_date = Column(DateTime(timezone=True), nullable=False)
     failure_mode = Column(String, nullable=False)
-    severity = Column(severity_enum, nullable=False)
+    severity = Column(String, nullable=False)
     description = Column(Text, nullable=False)
     
     # Enlaces opcionales a contexto técnico

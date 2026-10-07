@@ -9,14 +9,13 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 from pydantic import BaseModel, field_validator
-from models.failure_history import FailureSeverity
 
 class FailureHistoryBase(BaseModel):
     """Campos base para el registro de una avería."""
     equipment_id: uuid.UUID
     failure_date: datetime
     failure_mode: str
-    severity: FailureSeverity
+    severity: str
     description: str
     metric_at_failure_id: Optional[uuid.UUID] = None
     fmea_analysis_id: Optional[uuid.UUID] = None
