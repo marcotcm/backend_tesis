@@ -7,6 +7,19 @@ from datetime import datetime
 from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
+EQUIPMENT_BULK_COLUMNS = (
+    "taxonomy_id",
+    "tag_number",
+    "name",
+    "equipment_type",
+    "operational_status",
+    "brand",
+    "model",
+    "function_description",
+    "technical_specifications",
+)
+
+
 class EquipmentBase(BaseModel):
     taxonomy_id: uuid.UUID
     tag_number: str
@@ -51,3 +64,17 @@ class EquipmentResponse(EquipmentBase):
 
     class Config:
         from_attributes = True
+
+
+class EquipmentBulkError(BaseModel):
+    row: int
+    tag_number: Optional[str] = None
+    error: str
+
+
+class EquipmentBulkImportResponse(BaseModel):
+    total_records: int
+    successful_count: int
+    failed_count: int
+    created_ids: list[uuid.UUID]
+    errors: list[EquipmentBulkError]

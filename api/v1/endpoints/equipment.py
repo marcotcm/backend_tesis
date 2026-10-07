@@ -3,18 +3,76 @@ Endpoints para la gestión de equipos y activos.
 """
 
 import uuid
-from typing import List, Optional
+from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, File, Query, Response, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.session import get_db
 from core.security import get_current_user
 from models.user import User
-from schemas.equipment import EquipmentCreate, EquipmentResponse, EquipmentUpdate, UsageTimeUpdate
+from schemas.equipment import (
+    EquipmentBulkImportResponse,
+    EquipmentCreate,
+    EquipmentResponse,
+    EquipmentUpdate,
+    UsageTimeUpdate,
+)
+from services import equipment_bulk as equipment_bulk_service
 from services import equipment as equipment_service
 
 router = APIRouter()
+
+@router.post(
+    "/bulk",
+    response_model=EquipmentBulkImportResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Importar equipos en lote",
+)
+async def importar_equipos(
+    taxonomy_id: Optional[uuid.UUID] = Query(
+        None,
+        description="UUID de la taxonomía; úsalo para resolver nombres duplicados.",
+    ),
+    taxonomy_name: Optional[str] = Query(
+        None,
+        min_length=1,
+        description="Nombre de la taxonomía; debe ser único si no se envía taxonomy_id.",
+    ),
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Importa un CSV o XLSX de forma transaccional: todo el lote o ninguno."""
+    return await equipment_bulk_service.import_equipments(
+        db=db,
+        taxonomy_id=taxonomy_id,
+        taxonomy_name=taxonomy_name,
+        file=file,
+        user=current_user,
+    )
+
+
+@router.get(
+    "/export",
+    summary="Exportar equipos de una taxonomía",
+)
+async def exportar_equipos(
+    taxonomy_id: uuid.UUID = Query(..., description="UUID de la taxonomía seleccionada."),
+    file_format: Literal["xlsx", "csv"] = Query("xlsx", alias="format"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    contents, media_type, filename = await equipment_bulk_service.export_equipments(
+        db=db,
+        taxonomy_id=taxonomy_id,
+        file_format=file_format,
+    )
+    return Response(
+        content=contents,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 @router.post(
     "/",

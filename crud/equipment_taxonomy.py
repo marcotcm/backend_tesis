@@ -6,7 +6,7 @@ import uuid
 from typing import List, Optional
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.equipment import Equipment
@@ -27,6 +27,18 @@ async def get_taxonomy_by_id(db: AsyncSession, taxonomy_id: uuid.UUID) -> Option
         )
     )
     return result.scalars().first()
+
+async def get_taxonomies_by_name(
+    db: AsyncSession, name: str
+) -> List[EquipmentTaxonomy]:
+    normalized_name = name.strip().casefold()
+    result = await db.execute(
+        select(EquipmentTaxonomy).where(
+            func.lower(func.trim(EquipmentTaxonomy.name)) == normalized_name,
+            EquipmentTaxonomy.deleted_at.is_(None),
+        )
+    )
+    return list(result.scalars().all())
 
 async def get_taxonomies(db: AsyncSession, skip: int = 0, limit: int = 100) -> List[EquipmentTaxonomy]:
     result = await db.execute(

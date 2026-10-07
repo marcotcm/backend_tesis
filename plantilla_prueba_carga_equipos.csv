@@ -1,0 +1,4 @@
+taxonomy_id,tag_number,name,equipment_type,operational_status,brand,model,function_description,technical_specifications
+,TEST-BULK-20261005-001,Bomba centrifuga de prueba,Rotativo,operational,Marca Demo,BD-100,Bombeo de agua de prueba,"{""potencia_kw"":15,""rpm"":1800}"
+,TEST-BULK-20261005-002,Tanque estatico de prueba,Estatico,standby,Marca Demo,TD-200,Almacenamiento temporal de agua,"{""capacidad_m3"":50,""material"":""acero"",""presion_diseno_psi"":14.7}"
+,TEST-BULK-20261005-003,Motor electrico de prueba,Electrico,under_maintenance,Marca Demo,MD-300,Accionamiento de equipo de prueba,"{""potencia_kw"":22,""voltaje_v"":480}"

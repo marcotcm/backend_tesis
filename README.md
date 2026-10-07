@@ -139,10 +139,33 @@ son `daytime` y `nighttime`.
 | `GET` | `/{id}` | Consultar equipo |
 | `PATCH` | `/{id}` | Actualizar equipo |
 | `DELETE` | `/{id}` | Dar de baja lógicamente el equipo |
+| `POST` | `/bulk?taxonomy_name={nombre}` | Importar lote CSV/XLSX para un nombre de taxonomía único |
+| `POST` | `/bulk?taxonomy_id={uuid}` | Importar lote CSV/XLSX por UUID, también para resolver nombres duplicados |
+| `GET` | `/export?taxonomy_id={uuid}&format=xlsx` | Exportar equipos de la taxonomía como XLSX o CSV |
 
 Los tipos admitidos son `Estatico`, `Rotativo`, `Electrico` e
 `Instrumentacion`. Los estados operativos son `operational`, `standby`,
 `under_maintenance` y `failed`.
+
+La importación y exportación usan los mismos encabezados, en este orden:
+`taxonomy_id`, `tag_number`, `name`, `equipment_type`, `operational_status`,
+`brand`, `model`, `function_description`, `technical_specifications`. Para importar,
+el cliente envía `taxonomy_name` o `taxonomy_id` como parámetro de consulta.
+Si se envía `taxonomy_id`, el backend selecciona exactamente esa taxonomía; también
+se puede enviar el nombre junto al UUID, en cuyo caso ambos deben coincidir.
+Sin UUID, el backend busca un único nombre activo (ignorando mayúsculas y espacios
+al inicio/final). `taxonomy_id` de cada fila puede quedar vacío o, si se proporciona,
+debe coincidir con la taxonomía seleccionada. `technical_specifications` debe ser un objeto JSON
+válido o quedar vacío. La carga es todo-o-nada: si hay errores, no se inserta
+ninguna fila y la respuesta identifica las filas problemáticas. El creador se
+toma del usuario autenticado; los tags duplicados se rechazan incluso si el
+equipo existente fue dado de baja. La exportación incluye también equipos dados
+de baja. El formato predeterminado de exportación es XLSX; `format=csv` produce
+CSV UTF-8 con BOM.
+
+Si el nombre no existe o el UUID no corresponde a una taxonomía activa, la
+importación responde `404`; si el nombre es ambiguo y no se envía UUID, responde
+`409` indicando que se debe seleccionar una taxonomía por UUID.
 
 ### Mantenimientos — `/api/v1/mantenimientos`
 
@@ -208,6 +231,29 @@ Estas rutas requieren un token JWT válido.
 | `GET` | `/` | Listar correcciones |
 | `GET` | `/{id}` | Consultar corrección |
 | `PATCH` | `/{id}` | Actualizar texto de corrección |
+
+### Dashboard — `/api/v1/dashboard`
+
+Estas rutas requieren un token JWT válido.
+
+| Método | Ruta | Descripción |
+| --- | --- | --- |
+| `GET` | `/resumen` | Devuelve estadísticas agregadas y actividad reciente; `activity_limit` permite de 1 a 50 eventos (predeterminado: 10). |
+
+El resumen incluye equipos totales y por estado operativo, equipos activos con
+criticidad `Alta`, órdenes de trabajo pendientes/en proceso, órdenes terminadas
+durante el mes UTC actual, órdenes vencidas, fallas registradas, promedio del
+downtime informado en fallas y actividad reciente de órdenes, fallas,
+mantenimientos y recomendaciones. `total` cuenta todos los registros de equipos;
+`inactive` cuenta los inactivos o dados de baja lógicamente. El contador
+`critical` solo incluye equipos activos/no eliminados con `criticality_level =
+'Alta'`.
+
+No se devuelve un índice de disponibilidad ni MTBF/MTTR: el esquema actual no
+define la ventana ni los denominadores necesarios para esos indicadores. Tampoco
+se incluyen alarmas activas ni el bloque de salud operativa de planta, que queda
+reservado para la futura integración de IA. El endpoint es de solo lectura y no
+requiere cambios en la base de datos.
 
 ## Estructura del proyecto
 
