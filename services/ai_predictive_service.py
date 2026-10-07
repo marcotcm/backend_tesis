@@ -17,6 +17,7 @@ from crud import ai_recommendation as crud_recommendation
 # Inicializar cliente de la API de Gemini
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
+
 async def ejecutar_analisis_predictivo_ia(
     db: AsyncSession, 
     equipment_id: uuid.UUID, 
@@ -105,7 +106,7 @@ async def ejecutar_analisis_predictivo_ia(
     )
 
     respuesta = client.models.generate_content(
-        model="gemini-3.8-flash",
+        model="gemini-1.5-flash",
         contents=contexto_tecnico,
         config=configuracion
     )
