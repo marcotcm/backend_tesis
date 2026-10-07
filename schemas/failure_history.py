@@ -1,8 +1,5 @@
 """
 Esquemas Pydantic para el Historial de Fallas.
-
-Aplica validaciones estrictas para evitar datos de campo inconsistentes 
-(ej. reportar fallas en el futuro o tiempos negativos).
 """
 
 import uuid
@@ -15,7 +12,7 @@ class FailureHistoryBase(BaseModel):
     equipment_id: uuid.UUID
     failure_date: datetime
     failure_mode: str
-    severity: str
+    severity: str  # <- Manejado como texto plano
     description: str
     metric_at_failure_id: Optional[uuid.UUID] = None
     fmea_analysis_id: Optional[uuid.UUID] = None
@@ -24,7 +21,6 @@ class FailureHistoryBase(BaseModel):
     @field_validator("failure_date")
     @classmethod
     def validate_failure_date(cls, v: datetime) -> datetime:
-        """Evita errores de tipeo bloqueando fechas en el futuro."""
         if v > datetime.now(timezone.utc):
             raise ValueError("La fecha de falla no puede ser una fecha en el futuro.")
         return v
@@ -32,22 +28,18 @@ class FailureHistoryBase(BaseModel):
     @field_validator("downtime_hours")
     @classmethod
     def validate_downtime(cls, v: Optional[float]) -> Optional[float]:
-        """Asegura que el tiempo de inactividad tenga lógica física."""
         if v is not None and v < 0:
             raise ValueError("Las horas de inactividad (downtime) no pueden ser negativas.")
         return v
 
 class FailureHistoryCreate(FailureHistoryBase):
-    """Esquema para reportar una nueva avería. El autor se inyecta desde el token."""
+    """Esquema para reportar una nueva avería."""
     pass
 
 class FailureHistoryUpdate(BaseModel):
-    """
-    Esquema para actualizaciones parciales. 
-    Permite corregir detalles técnicos si se evalúa mejor la rotura a posteriori.
-    """
+    """Esquema para actualizaciones parciales."""
     failure_mode: Optional[str] = None
-    severity: Optional[str] = None
+    severity: Optional[str] = None  # <- Manejado como texto plano
     description: Optional[str] = None
     fmea_analysis_id: Optional[uuid.UUID] = None
     downtime_hours: Optional[float] = None
