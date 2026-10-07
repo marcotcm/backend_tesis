@@ -16,7 +16,6 @@ api_router = APIRouter()
 api_router.include_router(user.router, prefix="/usuarios", tags=["Usuarios"])
 
 # Registro de enrutadores del dominio técnico
-# Registro de enrutadores del dominio técnico
 api_router.include_router(equipment_taxonomy.router, prefix="/taxonomia", tags=["Taxonomía de Equipos"])
 api_router.include_router(equipment.router, prefix="/equipos", tags=["Equipos"])
 api_router.include_router(maintenance.router, prefix="/mantenimientos", tags=["Mantenimientos"])
