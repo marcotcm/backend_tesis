@@ -47,7 +47,7 @@ class FailureHistoryUpdate(BaseModel):
     Permite corregir detalles técnicos si se evalúa mejor la rotura a posteriori.
     """
     failure_mode: Optional[str] = None
-    severity: Optional[FailureSeverity] = None
+    severity: Optional[str] = None
     description: Optional[str] = None
     fmea_analysis_id: Optional[uuid.UUID] = None
     downtime_hours: Optional[float] = None
