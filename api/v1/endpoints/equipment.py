@@ -58,7 +58,15 @@ async def importar_equipos(
     summary="Exportar equipos de una taxonomía",
 )
 async def exportar_equipos(
-    taxonomy_id: uuid.UUID = Query(..., description="UUID de la taxonomía seleccionada."),
+    taxonomy_id: Optional[uuid.UUID] = Query(
+        None,
+        description="UUID de la taxonomía; úsalo para resolver nombres duplicados.",
+    ),
+    taxonomy_name: Optional[str] = Query(
+        None,
+        min_length=1,
+        description="Nombre de la taxonomía; debe ser único si no se envía taxonomy_id.",
+    ),
     file_format: Literal["xlsx", "csv"] = Query("xlsx", alias="format"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -66,6 +74,7 @@ async def exportar_equipos(
     contents, media_type, filename = await equipment_bulk_service.export_equipments(
         db=db,
         taxonomy_id=taxonomy_id,
+        taxonomy_name=taxonomy_name,
         file_format=file_format,
     )
     return Response(

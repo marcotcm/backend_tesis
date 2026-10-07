@@ -141,13 +141,14 @@ son `daytime` y `nighttime`.
 | `DELETE` | `/{id}` | Dar de baja lógicamente el equipo |
 | `POST` | `/bulk?taxonomy_name={nombre}` | Importar lote CSV/XLSX para un nombre de taxonomía único |
 | `POST` | `/bulk?taxonomy_id={uuid}` | Importar lote CSV/XLSX por UUID, también para resolver nombres duplicados |
-| `GET` | `/export?taxonomy_id={uuid}&format=xlsx` | Exportar equipos de la taxonomía como XLSX o CSV |
+| `GET` | `/export?taxonomy_name={nombre}&format=xlsx` | Exportar por nombre único de taxonomía |
+| `GET` | `/export?taxonomy_id={uuid}&format=xlsx` | Exportar por UUID, también para resolver nombres duplicados |
 
 Los tipos admitidos son `Estatico`, `Rotativo`, `Electrico` e
 `Instrumentacion`. Los estados operativos son `operational`, `standby`,
 `under_maintenance` y `failed`.
 
-La importación y exportación usan los mismos encabezados, en este orden:
+La hoja `Equipos` de importaciones y exportaciones usa estos encabezados, en este orden:
 `taxonomy_id`, `tag_number`, `name`, `equipment_type`, `operational_status`,
 `brand`, `model`, `function_description`, `technical_specifications`. Para importar,
 el cliente envía `taxonomy_name` o `taxonomy_id` como parámetro de consulta.
@@ -155,17 +156,24 @@ Si se envía `taxonomy_id`, el backend selecciona exactamente esa taxonomía; ta
 se puede enviar el nombre junto al UUID, en cuyo caso ambos deben coincidir.
 Sin UUID, el backend busca un único nombre activo (ignorando mayúsculas y espacios
 al inicio/final). `taxonomy_id` de cada fila puede quedar vacío o, si se proporciona,
-debe coincidir con la taxonomía seleccionada. `technical_specifications` debe ser un objeto JSON
-válido o quedar vacío. La carga es todo-o-nada: si hay errores, no se inserta
+debe coincidir con la taxonomía seleccionada.
+
+En archivos XLSX se incluye además la hoja `Especificaciones`, con columnas
+`tag_number`, `especificacion` y `valor`, una fila por característica técnica.
+En ese formato, `technical_specifications` debe quedar vacío; el backend arma
+el objeto JSON asociando las filas por tag. También se siguen aceptando XLSX
+antiguos de una sola hoja y CSV con el objeto JSON en `technical_specifications`.
+La carga es todo-o-nada: si hay errores, no se inserta
 ninguna fila y la respuesta identifica las filas problemáticas. El creador se
 toma del usuario autenticado; los tags duplicados se rechazan incluso si el
 equipo existente fue dado de baja. La exportación incluye también equipos dados
-de baja. El formato predeterminado de exportación es XLSX; `format=csv` produce
-CSV UTF-8 con BOM.
+de baja. La exportación también acepta `taxonomy_name` o `taxonomy_id` con la misma
+resolución que la importación. El formato predeterminado es XLSX;
+`format=csv` produce CSV UTF-8 con BOM.
 
 Si el nombre no existe o el UUID no corresponde a una taxonomía activa, la
-importación responde `404`; si el nombre es ambiguo y no se envía UUID, responde
-`409` indicando que se debe seleccionar una taxonomía por UUID.
+importación/exportación responde `404`; si el nombre es ambiguo y no se envía
+UUID, responde `409` indicando que se debe seleccionar una taxonomía por UUID.
 
 ### Mantenimientos — `/api/v1/mantenimientos`
 
