@@ -6,6 +6,7 @@ from sqlalchemy import select, and_
 
 from google import genai
 from google.genai import types
+from google.genai.errors import ServerError, ClientError
 
 from models.equipment import Equipment
 from models.equipment_metrics import EquipmentMetricHistory
@@ -105,15 +106,22 @@ async def ejecutar_analisis_predictivo_ia(
         temperature=0.2,
     )
 
-    respuesta = client.models.generate_content(
-        model="gemini-1.5-flash",
-        contents=contexto_tecnico,
-        config=configuracion
-    )
+    try:
+        respuesta = client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=contexto_tecnico,
+            config=configuracion
+        )
+    except ServerError as e:
+        print(f"[AVISO] Los servidores de Google experimentan alta demanda (503): {e}")
+        return {"analisis_ia": "Servicio de IA temporalmente ocupado. Métrica guardada correctamente.", "recomendacion_generada": False}
+    except Exception as e:
+        print(f"[ERROR] Error inesperado al consultar Gemini: {e}")
+        return {"analisis_ia": f"Error de IA: {str(e)}", "recomendacion_generada": False}
 
     # 9. Procesar la llamada a la función si la IA decidió guardar la recomendación
     recomendacion_creada = None
-    if respuesta.function_calls:
+    if getattr(respuesta, "function_calls", None):
         for llamada in respuesta.function_calls:
             if llamada.name == "registrar_recomendacion_bd":
                 args = llamada.args
@@ -129,7 +137,7 @@ async def ejecutar_analisis_predictivo_ia(
                 recomendacion_creada = await crud_recommendation.create(db, payload_db)
 
     return {
-        "analisis_ia": respuesta.text,
+        "analisis_ia": getattr(respuesta, "text", "Sin respuesta de texto"),
         "recomendacion_generada": recomendacion_creada is not None,
         "detalle_recomendacion": recomendacion_creada
     }
