@@ -3,13 +3,15 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, Field
 
-# Ajusta estos imports según la estructura real de tus carpetas
+# Ajustes de dependencias del proyecto
 from core.security import get_current_user
 from db.session import get_db
 from models.user import User
 from services.ai_predictive_service import (
     ejecutar_analisis_predictivo_ia,
-    generar_plan_mantenimiento_ia
+    generar_plan_mantenimiento_ia,
+    evaluar_riesgo_global_planta,
+    generar_planes_mantenimiento_globales
 )
 
 router = APIRouter()
@@ -25,7 +27,7 @@ class GenerarPlanRequest(BaseModel):
 
 
 # =====================================================================
-# RUTAS (ENDPOINTS)
+# RUTAS INDIVIDUALES (LAS QUE YA TENÍAS)
 # =====================================================================
 
 @router.post(
@@ -109,5 +111,64 @@ async def generar_plan_manual(
 
     return {
         "mensaje": "Plan de mantenimiento generado y enviado a bandeja de auditoría.",
+        "resultado": resultado
+    }
+
+
+# =====================================================================
+# NUEVAS RUTAS GLOBALES (NIVEL PLANTA)
+# =====================================================================
+
+@router.get(
+    "/riesgo-planta",
+    status_code=status.HTTP_200_OK,
+    summary="Análisis de riesgo global (Radar Predictivo ML)",
+    description="Escanea toda la maquinaria activa usando el modelo estadístico XGBoost para identificar equipos próximos a fallar. Alta velocidad, no consume cuota generativa."
+)
+async def analizar_riesgo_planta(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    * **Ruta:** GET /api/v1/ai-predictivo/riesgo-planta
+    * **Uso:** Obtiene el listado de máquinas ordenadas por probabilidad estadística de falla inminente.
+    """
+    resultado = await evaluar_riesgo_global_planta(db=db)
+    return {
+        "mensaje": "Análisis de riesgo global ejecutado con éxito.",
+        "resultado": resultado
+    }
+
+
+@router.post(
+    "/planes-planta",
+    status_code=status.HTTP_200_OK,
+    summary="Generar planes en lote para equipos en riesgo",
+    description="Filtra las máquinas en riesgo usando Machine Learning y delega a la IA generativa la creación de un plan de mantenimiento preventivo para cada una."
+)
+async def generar_planes_planta(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    * **Ruta:** POST /api/v1/ai-predictivo/planes-planta
+    * **Uso:** Operación en lote (Batch) que automatiza la planificación táctica de mantenimiento para activos críticos detectados por ML.
+    """
+    origen_disparo = f"Generación Masiva de Planes Solicitada por: {current_user.email}"
+    
+    resultado = await generar_planes_mantenimiento_globales(
+        db=db,
+        trigger_source=origen_disparo
+    )
+    
+    # Manejo de error en caso de que el escaneo falle en generar la pauta para todos los detectados
+    if resultado["planes_creados"] == 0 and len(resultado.get("errores", [])) > 0:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Se encontraron equipos en riesgo, pero falló la generación de los planes en todos los casos."
+        )
+
+    return {
+        "mensaje": f"Se han generado {resultado['planes_creados']} planes de mantenimiento para equipos en alerta.",
         "resultado": resultado
     }
