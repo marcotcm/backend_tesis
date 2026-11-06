@@ -8,7 +8,6 @@ Directory structure:
     ├── modelo_bomba_inyeccion.pkl
     ├── plantilla_prueba_carga_equipos.csv
     ├── requirements.txt
-    ├── train_ml_heimdall.py
     ├── api/
     │   └── v1/
     │       ├── api.py
@@ -211,6 +210,8 @@ Salvo donde se indique, `:id` representa un UUID. Los listados paginados aceptan
 | `GET` | `/me` | Autenticado |
 | `POST` | `/me/push-tokens` | Token validado por Supabase; registra o actualiza el token del dispositivo |
 | `DELETE` | `/me/push-tokens` | Token validado por Supabase; desactiva el token del dispositivo |
+| `GET` | `/me/push-tokens` | Token validado por Supabase; lista los propios tokens, enmascarados |
+| `GET` | `/push-tokens` | Solo `admin`; lista todos los tokens completos (dato sensible) |
 | `GET` | `/` | Roles `admin` o `technical_auditor` |
 | `GET` | `/buscar?nombre=...` | Autenticado |
 | `GET` | `/buscar-email?email=...` | Autenticado |
@@ -227,6 +228,10 @@ Los endpoints de tokens push reciben un JSON `{"token": "..."}` y obtienen el
 usuario desde el token de acceso validado por Supabase. Si el mismo token ya
 estaba registrado, se reactiva y se asocia al usuario actual; al desvincularlo,
 se marca inactivo. TodavÃ­a no se envÃ­an notificaciones push desde estos endpoints.
+Las consultas de tokens estÃ¡n paginadas con `skip` y `limit`. La consulta propia
+devuelve el token enmascarado; la consulta global devuelve el token completo y
+estÃ¡ restringida a administradores, por lo que su respuesta debe manejarse como
+informaciÃ³n sensible.
 
 ### TaxonomÃ­a â€” `/api/v1/taxonomia`
 
@@ -5564,19 +5569,15 @@ taxonomy_id,tag_number,name,equipment_type,operational_status,brand,model,functi
 ================================================
 FILE: requirements.txt
 ================================================
-annotated-doc==0.0.4
-annotated-types==0.7.0
 anyio==4.14.2
 asyncpg==0.31.0
 certifi==2026.6.17
 cffi==2.1.0
-charset-normalizer==3.5.2
 click==8.4.2
 colorama==0.4.6
 cryptography==49.0.0
 deprecation==2.1.0
 distro==1.9.0
-dnspython==2.8.0
 email-validator==2.3.0
 et_xmlfile==2.0.0
 fastapi==0.139.0
@@ -5593,11 +5594,10 @@ hyperframe==6.1.0
 idna==3.18
 joblib>=1.4,<2
 multidict==6.7.1
-numpy>=1.26,<3
+
 openpyxl==3.1.5
 pandas>=2.2,<4
 packaging==26.2
-pgvector==0.5.0
 postgrest==2.31.0
 propcache==0.5.2
 pyasn1==0.6.4
@@ -5609,34 +5609,23 @@ pydantic_core==2.46.4
 PyJWT==2.13.0
 python-dotenv==1.2.2
 python-multipart==0.0.32
-PyYAML==6.0.3
 realtime==2.31.0
 requests==2.34.2
 sniffio==1.3.1
 SQLAlchemy==2.0.51
-scikit-learn>=1.5,<2
 starlette==1.3.1
 storage3==2.31.0
 StrEnum==0.4.15
 supabase==2.31.0
 supabase-auth==2.31.0
-supabase-functions==2.31.0
 tenacity==9.1.4
-typing-inspection==0.4.2
 typing_extensions==4.16.0
 urllib3==2.8.0
 uvicorn==0.51.0
 watchfiles==1.2.0
 websockets==15.0.1
-xgboost>=2.1,<4
 yarl==1.24.2
 
-
-
-================================================
-FILE: train_ml_heimdall.py
-================================================
-Error reading file with 'cp1252': 'charmap' codec can't decode byte 0x8d in position 2583: character maps to <undefined>
 
 
 ================================================
@@ -5656,13 +5645,14 @@ from api.v1.endpoints import (
 
 api_router = APIRouter()
 
-# Registro del enrutador de usuarios
-api_router.include_router(user.router, prefix="/usuarios", tags=["Usuarios"])
+# Registrar primero los endpoints de tokens para evitar que /push-tokens
+# coincida con la ruta dinÃ¡mica /usuarios/{id}.
 api_router.include_router(
     user_push_tokens.router,
-    prefix="/usuarios/me/push-tokens",
+    prefix="/usuarios",
     tags=["Tokens Push"],
 )
+api_router.include_router(user.router, prefix="/usuarios", tags=["Usuarios"])
 
 # Registro de enrutadores del dominio tÃ©cnico
 api_router.include_router(equipment_taxonomy.router, prefix="/taxonomia", tags=["TaxonomÃ­a de Equipos"])
@@ -7320,21 +7310,75 @@ async def eliminar_usuario(
 ================================================
 FILE: api/v1/endpoints/user_push_tokens.py
 ================================================
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.security import get_verified_current_user
 from db.session import get_db
-from models.user import User
+from models.user import User, UserRole
 from models.user_push_token import UserPushToken
-from schemas.user_push_token import UserPushTokenCreate, UserPushTokenResponse
+from schemas.user_push_token import (
+    UserPushTokenCreate,
+    UserPushTokenAdminResponse,
+    UserPushTokenResponse,
+    UserPushTokenSummary,
+)
 from services import user_push_token as user_push_token_service
 
 router = APIRouter()
 
 
+def summarize_token(token: UserPushToken) -> UserPushTokenSummary:
+    suffix = token.token[-4:] if len(token.token) > 4 else "****"
+    return UserPushTokenSummary(
+        id=token.id,
+        user_id=token.user_id,
+        token_suffix=f"...{suffix}",
+        is_active=token.is_active,
+        created_at=token.created_at,
+        updated_at=token.updated_at,
+        last_seen_at=token.last_seen_at,
+    )
+
+
+@router.get(
+    "/me/push-tokens",
+    response_model=list[UserPushTokenSummary],
+    summary="Listar mis tokens push",
+)
+async def list_my_push_tokens(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_verified_current_user),
+) -> list[UserPushTokenSummary]:
+    tokens = await user_push_token_service.list_user_tokens(
+        db, current_user.id, skip, limit
+    )
+    return [summarize_token(token) for token in tokens]
+
+
+@router.get(
+    "/push-tokens",
+    response_model=list[UserPushTokenAdminResponse],
+    summary="Listar todos los tokens push completos (administrador)",
+)
+async def list_all_push_tokens(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_verified_current_user),
+) -> list[UserPushTokenAdminResponse]:
+    if current_user.role != UserRole.admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo un administrador puede consultar todos los tokens push.",
+        )
+    return await user_push_token_service.list_all_tokens(db, skip, limit)
+
+
 @router.post(
-    "",
+    "/me/push-tokens",
     response_model=UserPushTokenResponse,
     status_code=status.HTTP_200_OK,
     summary="Registrar token push del dispositivo",
@@ -7349,7 +7393,7 @@ async def register_push_token(
 
 
 @router.delete(
-    "",
+    "/me/push-tokens",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Desvincular token push del dispositivo",
 )
@@ -8776,11 +8820,41 @@ FILE: crud/user_push_token.py
 ================================================
 import uuid
 
-from sqlalchemy import func, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.user_push_token import UserPushToken
+
+
+async def list_user_tokens(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    skip: int = 0,
+    limit: int = 100,
+) -> list[UserPushToken]:
+    result = await db.execute(
+        select(UserPushToken)
+        .where(UserPushToken.user_id == user_id)
+        .order_by(UserPushToken.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def list_all_tokens(
+    db: AsyncSession,
+    skip: int = 0,
+    limit: int = 100,
+) -> list[UserPushToken]:
+    result = await db.execute(
+        select(UserPushToken)
+        .order_by(UserPushToken.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    return list(result.scalars().all())
 
 
 async def register_or_update_token(
@@ -10261,6 +10335,29 @@ class UserPushTokenCreate(BaseModel):
 
 class UserPushTokenResponse(BaseModel):
     id: uuid.UUID
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+    last_seen_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class UserPushTokenSummary(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID
+    token_suffix: str
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+    last_seen_at: Optional[datetime] = None
+
+
+class UserPushTokenAdminResponse(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID
+    token: str
     is_active: bool
     created_at: datetime
     updated_at: datetime
@@ -11994,6 +12091,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from crud import user_push_token as crud_user_push_token
 from models.user_push_token import UserPushToken
+
+
+async def list_user_tokens(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    skip: int = 0,
+    limit: int = 100,
+) -> list[UserPushToken]:
+    return await crud_user_push_token.list_user_tokens(db, user_id, skip, limit)
+
+
+async def list_all_tokens(
+    db: AsyncSession,
+    skip: int = 0,
+    limit: int = 100,
+) -> list[UserPushToken]:
+    return await crud_user_push_token.list_all_tokens(db, skip, limit)
 
 
 async def register_token(
