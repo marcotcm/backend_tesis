@@ -108,6 +108,8 @@ Salvo donde se indique, `:id` representa un UUID. Los listados paginados aceptan
 | `POST` | `/refresh` | Público; recibe `refresh_token` en el cuerpo |
 | `POST` | `/recuperar-contrasena` | Público |
 | `GET` | `/me` | Autenticado |
+| `POST` | `/me/push-tokens` | Token validado por Supabase; registra o actualiza el token del dispositivo |
+| `DELETE` | `/me/push-tokens` | Token validado por Supabase; desactiva el token del dispositivo |
 | `GET` | `/` | Roles `admin` o `technical_auditor` |
 | `GET` | `/buscar?nombre=...` | Autenticado |
 | `GET` | `/buscar-email?email=...` | Autenticado |
@@ -119,6 +121,11 @@ El perfil valida el formato de identificación venezolana (`V-`, `E-` o `P-`),
 teléfonos nacionales y mayoría de edad cuando se informa la fecha de nacimiento.
 Los roles disponibles son `admin`, `rcm_engineer` y `technical_auditor`; los turnos
 son `daytime` y `nighttime`.
+
+Los endpoints de tokens push reciben un JSON `{"token": "..."}` y obtienen el
+usuario desde el token de acceso validado por Supabase. Si el mismo token ya
+estaba registrado, se reactiva y se asocia al usuario actual; al desvincularlo,
+se marca inactivo. Todavía no se envían notificaciones push desde estos endpoints.
 
 ### Taxonomía — `/api/v1/taxonomia`
 
