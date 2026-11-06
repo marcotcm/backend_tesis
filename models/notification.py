@@ -7,9 +7,10 @@ from db.session import Base
 
 class Notification(Base):
     __tablename__ = "notifications"
+    __table_args__ = {"schema": "public"}
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True) # NULL = Notificación global
+    user_id = Column(UUID(as_uuid=True), ForeignKey("public.users.id"), nullable=True) # NULL = Notificación global
     title = Column(String, nullable=False)
     message = Column(Text, nullable=False)
     notification_type = Column(String, nullable=False) # 'alerta', 'ia', 'orden_trabajo', 'sistema'
