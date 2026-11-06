@@ -9,10 +9,14 @@ import uuid
 import jwt
 from fastapi import HTTPException, Security, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
 from db.session import get_db
 from crud.user import get_user_by_id
 from models.user import User, UserRole
+from db.supabaseR import get_supabase_admin
+from supabase import Client
+from supabase_auth.errors import AuthApiError
 
 # Esquema de seguridad estándar Bearer Token
 security = HTTPBearer()
@@ -69,6 +73,45 @@ async def get_current_user(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, 
             detail="El usuario no se encuentra activo o ha sido revocado del sistema."
+        )
+    return user
+
+async def get_verified_current_user(
+    credentials: HTTPAuthorizationCredentials = Security(security),
+    db: AsyncSession = Depends(get_db),
+    supabase_admin: Client = Depends(get_supabase_admin),
+) -> User:
+    """Valida la firma del token consultando Supabase antes de aceptar su identidad."""
+    try:
+        auth_response = await run_in_threadpool(
+            supabase_admin.auth.get_user,
+            credentials.credentials,
+        )
+    except AuthApiError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token de autorización inválido o expirado.",
+        )
+
+    if not auth_response.user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token de autorización inválido o expirado.",
+        )
+
+    try:
+        user_uuid = uuid.UUID(auth_response.user.id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="El token no contiene un identificador de usuario válido.",
+        )
+
+    user = await get_user_by_id(db, user_id=user_uuid)
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="El usuario no se encuentra activo o ha sido revocado del sistema.",
         )
     return user
 
