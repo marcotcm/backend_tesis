@@ -110,6 +110,8 @@ Salvo donde se indique, `:id` representa un UUID. Los listados paginados aceptan
 | `GET` | `/me` | Autenticado |
 | `POST` | `/me/push-tokens` | Token validado por Supabase; registra o actualiza el token del dispositivo |
 | `DELETE` | `/me/push-tokens` | Token validado por Supabase; desactiva el token del dispositivo |
+| `GET` | `/me/push-tokens` | Token validado por Supabase; lista los propios tokens, enmascarados |
+| `GET` | `/push-tokens` | Solo `admin`; lista todos los tokens completos (dato sensible) |
 | `GET` | `/` | Roles `admin` o `technical_auditor` |
 | `GET` | `/buscar?nombre=...` | Autenticado |
 | `GET` | `/buscar-email?email=...` | Autenticado |
@@ -126,6 +128,10 @@ Los endpoints de tokens push reciben un JSON `{"token": "..."}` y obtienen el
 usuario desde el token de acceso validado por Supabase. Si el mismo token ya
 estaba registrado, se reactiva y se asocia al usuario actual; al desvincularlo,
 se marca inactivo. Todavía no se envían notificaciones push desde estos endpoints.
+Las consultas de tokens están paginadas con `skip` y `limit`. La consulta propia
+devuelve el token enmascarado; la consulta global devuelve el token completo y
+está restringida a administradores, por lo que su respuesta debe manejarse como
+información sensible.
 
 ### Taxonomía — `/api/v1/taxonomia`
 

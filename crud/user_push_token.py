@@ -1,10 +1,40 @@
 import uuid
 
-from sqlalchemy import func, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.user_push_token import UserPushToken
+
+
+async def list_user_tokens(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    skip: int = 0,
+    limit: int = 100,
+) -> list[UserPushToken]:
+    result = await db.execute(
+        select(UserPushToken)
+        .where(UserPushToken.user_id == user_id)
+        .order_by(UserPushToken.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def list_all_tokens(
+    db: AsyncSession,
+    skip: int = 0,
+    limit: int = 100,
+) -> list[UserPushToken]:
+    result = await db.execute(
+        select(UserPushToken)
+        .order_by(UserPushToken.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    return list(result.scalars().all())
 
 
 async def register_or_update_token(
