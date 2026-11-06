@@ -26,3 +26,26 @@ class UserPushTokenResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class UserPushTokenSummary(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID
+    token_suffix: str
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+    last_seen_at: Optional[datetime] = None
+
+
+class UserPushTokenAdminResponse(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID
+    token: str
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+    last_seen_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
