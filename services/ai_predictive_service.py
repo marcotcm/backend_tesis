@@ -28,6 +28,7 @@ from models.equipment_criticality import EquipmentCriticality
 from models.ai_recommendation import AIRecommendation
 from models.ai_correction import AICorrection
 from crud import ai_recommendation as crud_recommendation
+from services.notification import notify_ai_analysis_ready
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -338,6 +339,15 @@ async def ejecutar_analisis_predictivo_ia(
         }
         
         recomendacion_creada = await crud_recommendation.create(db, payload_db)
+        
+        # --- NUEVO: Disparar Notificación de IA ---
+        if recomendacion_creada:
+            await notify_ai_analysis_ready(
+                db=db,
+                title="🧠 Análisis Predictivo IA Listo",
+                message=f"La IA ha generado un dictamen técnico de riesgo para el equipo {equipment.tag_number}.",
+                user_id=None
+            )
 
     return {
         "analisis_ia": resultado_dict, 
@@ -443,6 +453,15 @@ async def generar_plan_mantenimiento_ia(
     }
     
     recomendacion_creada = await crud_recommendation.create(db, payload_db)
+    
+    # --- NUEVO: Disparar Notificación de Plan IA ---
+    if recomendacion_creada:
+        await notify_ai_analysis_ready(
+            db=db,
+            title="📋 Plan de Mantenimiento IA Estructurado",
+            message=f"Se ha estructurado un plan '{plan_obj.title}' para el equipo {equipment.tag_number}.",
+            user_id=None
+        )
 
     # Output para inyectar directo al Frontend y visualización interactiva
     plan_final = {

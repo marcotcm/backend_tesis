@@ -19,6 +19,7 @@ from models.equipment_metrics import EquipmentMetricHistory
 from models.user import User, UserRole
 from schemas.equipment_metrics import EquipmentMetricCreate, EquipmentMetricUpdate
 from services.ai_predictive_service import ejecutar_analisis_predictivo_ia
+from services.notification import trigger_global_alert
 
 
 async def record_metric(
@@ -91,6 +92,13 @@ async def record_metric(
 
             # 3. Si se supera algún estándar, lanzar el análisis profundo con Gemini en segundo plano
             if disparar_ia:
+                # --- NUEVO: Disparar Notificación Global Automática ---
+                await trigger_global_alert(
+                    db=db,
+                    title="⚠️ Alerta: Métrica Anómala Detectada",
+                    message=f"El equipo {equipment.tag_number or metric_in.equipment_id} registró valores fuera de rango operativo normal. Iniciando análisis predictivo IA."
+                )
+                
                 background_tasks.add_task(
                     ejecutar_analisis_predictivo_ia,
                     db=db,

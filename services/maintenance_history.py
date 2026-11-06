@@ -11,13 +11,26 @@ from crud import maintenance_history as crud_history
 from schemas.maintenance_history import MaintenanceHistoryCreate, MaintenanceHistoryUpdate
 from models.maintenance_history import MaintenanceHistory
 from models.user import User, UserRole
+from services.notification import manager, create_notification
+from schemas.notification import NotificationCreate
 
 async def log_maintenance_execution(db: AsyncSession, record_in: MaintenanceHistoryCreate, current_user: User) -> MaintenanceHistory:
     record_data = record_in.model_dump()
     record_data["executed_by"] = current_user.id
     
     try:
-        return await crud_history.create_record(db, obj_in=record_data)
+        record = await crud_history.create_record(db, obj_in=record_data)
+        
+        # --- NUEVO: Disparar Notificación de Mantenimiento Iniciado ---
+        notif_data = NotificationCreate(
+            title="⚙️ Mantenimiento Registrado/Iniciado",
+            message=f"Se ha iniciado un nuevo descargo de mantenimiento para el equipo {record_in.equipment_id}.",
+            notification_type="sistema"
+        )
+        db_notif = await create_notification(db, notif_data)
+        await manager.broadcast({"event": "new_maintenance", "data": {"id": db_notif.id, "title": db_notif.title}})
+        
+        return record
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

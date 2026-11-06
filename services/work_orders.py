@@ -13,6 +13,7 @@ from crud import work_orders as crud_wo
 from schemas.work_orders import WorkOrderCreate, WorkOrderUpdate
 from models.work_orders import WorkOrder, WorkOrderStatus
 from models.user import User, UserRole
+from services.notification import notify_work_order_assignment
 
 async def create_new_work_order(db: AsyncSession, wo_in: WorkOrderCreate, current_user: User) -> WorkOrder:
     """Emite una nueva orden de trabajo, vinculándola criptográficamente al planificador en sesión."""
@@ -20,7 +21,18 @@ async def create_new_work_order(db: AsyncSession, wo_in: WorkOrderCreate, curren
     wo_data["created_by"] = current_user.id
     
     try:
-        return await crud_wo.create_work_order(db, obj_in=wo_data)
+        wo = await crud_wo.create_work_order(db, obj_in=wo_data)
+        
+        # --- NUEVO: Disparar Notificación de Asignación ---
+        if wo.assigned_to:
+            await notify_work_order_assignment(
+                db=db,
+                user_id=wo.assigned_to,
+                title="🛠️ Nueva Orden de Trabajo Asignada",
+                message=f"Se te ha asignado una nueva OT ({wo.id}) para ejecución en campo."
+            )
+            
+        return wo
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
