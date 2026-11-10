@@ -7,7 +7,7 @@ Agrupa todos los sub-enrutadores modulares de la aplicación para ser montados e
 from fastapi import APIRouter
 from api.v1.endpoints import (
     equipment, equipment_metrics, equipment_taxonomy, maintenance, user, user_push_tokens, failure_history, work_orders, maintenance_history,
-    equipment_criticality, fmea_analysis, ai_recommendation, ai_correction, dashboard, ai_predictive, notifications
+    equipment_criticality, fmea_analysis, ai_recommendation, ai_correction, dashboard, ai_predictive, notifications, chatbot
 )
 
 api_router = APIRouter()
@@ -36,3 +36,4 @@ api_router.include_router(ai_correction.router, prefix="/correcciones", tags=["C
 api_router.include_router(dashboard.router, prefix="/dashboard", tags=["Dashboard"])
 api_router.include_router(ai_predictive.router, prefix="/ai-predictivo", tags=["Análisis Predictivo IA"])
 api_router.include_router(notifications.router, prefix="/notificaciones", tags=["Notificaciones"])
+api_router.include_router(chatbot.router, prefix="/chatbot", tags=["Asistente IA Chatbot"])
