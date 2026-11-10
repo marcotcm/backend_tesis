@@ -3,13 +3,20 @@ api/v1/endpoints/chatbot.py
 Endpoints del Asistente Conversacional RCM (Chatbot) con Inteligencia Artificial.
 Inspirado en la arquitectura modular de maxton_ai_back (chatbot.controller.js / chatbot.routes.js)
 y adaptado al backend FastAPI de Heimdall RCM.
+Incluye endpoints de chat, análisis multimodal, preguntas frecuentes,
+y creación física de Órdenes de Trabajo y Planes de Mantenimiento en PostgreSQL.
 """
 
+import uuid
 from typing import Optional, List
+import jwt
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.session import get_db
+from models.user import User
+from crud.user import get_user_by_id
 from schemas.chatbot import (
     ChatRequest,
     ChatResponse,
@@ -18,10 +25,36 @@ from schemas.chatbot import (
     ChatHistoryResponse,
     ChatMessage,
     QuickQuestionItem,
+    CreateWorkOrderFromChatRequest,
+    CreateMaintenancePlanFromChatRequest,
+    ChatbotActionResponse,
 )
 from services.rcm_chatbot_service import rcm_chatbot_service
 
 router = APIRouter()
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+async def get_optional_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_db)
+) -> Optional[User]:
+    """Extrae el usuario autenticado si se provee Bearer Token válido, o None si no hay token."""
+    if not credentials or not credentials.credentials:
+        return None
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            options={"verify_signature": False},
+            algorithms=["ES256", "HS256"],
+            audience="authenticated"
+        )
+        user_id_str = payload.get("sub")
+        if user_id_str:
+            return await get_user_by_id(db, uuid.UUID(user_id_str))
+    except Exception:
+        pass
+    return None
 
 # Lista de preguntas rápidas predeterminadas para clientes móviles y web
 DEFAULT_QUICK_QUESTIONS = [
@@ -51,14 +84,14 @@ DEFAULT_QUICK_QUESTIONS = [
     ),
     QuickQuestionItem(
         id="q5",
-        label="Diagnóstico POZO-BCP-204",
-        question="Evalúa el estado técnico, vibración reciente y modos de falla del equipo POZO-BCP-204.",
+        label="Diagnóstico K-201A",
+        question="Evalúa el estado técnico, vibración reciente y modos de falla del compresor K-201A.",
         category="equipo"
     ),
     QuickQuestionItem(
         id="q6",
-        label="Cierre de Órdenes de Trabajo",
-        question="¿Cuáles son los pasos técnicos para el cierre adecuado de una orden de trabajo correctiva según RCM?",
+        label="Crear Orden de Trabajo",
+        question="Crea una orden de trabajo urgente para el compresor K-201A por vibración alta.",
         category="mantenimiento"
     )
 ]
@@ -72,7 +105,8 @@ DEFAULT_QUICK_QUESTIONS = [
 )
 async def chat_text(
     payload: ChatRequest,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    optional_user: Optional[User] = Depends(get_optional_current_user)
 ):
     """
     Ruta: POST /api/v1/chatbot/chat
@@ -85,11 +119,16 @@ async def chat_text(
         )
 
     try:
+        user_info = f"{optional_user.first_name} {optional_user.last_name} ({optional_user.role})" if optional_user else None
+        user_id = optional_user.id if optional_user else None
+
         result = await rcm_chatbot_service.process_message(
             message=payload.message.strip(),
             session_id=payload.session_id,
             equipment_id=payload.equipment_id,
-            db=db if payload.include_db_context else None
+            db=db if payload.include_db_context else None,
+            current_user_info=user_info,
+            current_user_id=user_id
         )
         return result
     except Exception as e:
@@ -110,7 +149,8 @@ async def chat_multimodal(
     session_id: Optional[str] = Form(default=None),
     equipment_id: Optional[str] = Form(default=None),
     file: Optional[UploadFile] = File(default=None),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    optional_user: Optional[User] = Depends(get_optional_current_user)
 ):
     """
     Ruta: POST /api/v1/chatbot/chat-multimodal
@@ -126,7 +166,6 @@ async def chat_multimodal(
     mime_type = None
 
     if file:
-        # Validar tipo de contenido de imagen
         if not file.content_type or not file.content_type.startswith("image/"):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -142,13 +181,18 @@ async def chat_multimodal(
             )
 
     try:
+        user_info = f"{optional_user.first_name} {optional_user.last_name} ({optional_user.role})" if optional_user else None
+        user_id = optional_user.id if optional_user else None
+
         result = await rcm_chatbot_service.process_message(
-            message=message or "Analiza esta imagen industrial e identifica el equipo, daño físico o parámetros.",
+            message=message or "Analiza esta imagen industrial e identifica el activo, falla física o telemetría.",
             session_id=session_id,
             equipment_id=equipment_id,
             image_bytes=image_bytes,
             mime_type=mime_type,
-            db=db
+            db=db,
+            current_user_info=user_info,
+            current_user_id=user_id
         )
         return result
     except Exception as e:
@@ -156,6 +200,92 @@ async def chat_multimodal(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error procesando el análisis multimodal en el asistente IA: {str(e)}"
         )
+
+@router.post(
+    "/crear-orden-trabajo",
+    response_model=ChatbotActionResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Crear Orden de Trabajo desde el Copiloto IA",
+    description="Permite al Asistente IA o al usuario con 1 clic generar una Orden de Trabajo física en PostgreSQL vinculada a un activo industrial."
+)
+async def crear_orden_trabajo_desde_chat(
+    payload: CreateWorkOrderFromChatRequest,
+    db: AsyncSession = Depends(get_db),
+    optional_user: Optional[User] = Depends(get_optional_current_user)
+):
+    target = payload.equipment_tag or payload.equipment_id
+    if not target:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Debe indicar el TAG o UUID del activo industrial."
+        )
+
+    res = await rcm_chatbot_service.create_work_order_from_chat(
+        db=db,
+        title=payload.title,
+        equipment_id_or_tag=target,
+        priority=payload.priority,
+        technician_notes=payload.technician_notes,
+        scheduled_for=payload.scheduled_for,
+        current_user_id=optional_user.id if optional_user else None
+    )
+
+    if not res.get("success"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=res.get("error", "Error creando orden de trabajo.")
+        )
+
+    return ChatbotActionResponse(
+        success=True,
+        message=f"Orden de trabajo '{res['work_order_id']}' creada exitosamente para activo {res['equipment_tag']}.",
+        created_id=res["work_order_id"],
+        entity_type="work_order",
+        data=res
+    )
+
+@router.post(
+    "/crear-plan",
+    response_model=ChatbotActionResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Crear Plan de Mantenimiento desde el Copiloto IA",
+    description="Genera un nuevo Plan de Mantenimiento (Preventivo / Predictivo) directamente en PostgreSQL."
+)
+async def crear_plan_desde_chat(
+    payload: CreateMaintenancePlanFromChatRequest,
+    db: AsyncSession = Depends(get_db),
+    optional_user: Optional[User] = Depends(get_optional_current_user)
+):
+    target = payload.equipment_tag or payload.equipment_id
+    if not target:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Debe indicar el TAG o UUID del activo industrial."
+        )
+
+    res = await rcm_chatbot_service.create_maintenance_plan_from_chat(
+        db=db,
+        title=payload.title,
+        equipment_id_or_tag=target,
+        maintenance_type=payload.maintenance_type,
+        frequency_days=payload.frequency_days or 30,
+        description=payload.description,
+        current_user_id=optional_user.id if optional_user else None
+    )
+
+    if not res.get("success"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=res.get("error", "Error creando plan de mantenimiento.")
+        )
+
+    return ChatbotActionResponse(
+        success=True,
+        message=f"Plan de mantenimiento '{res['maintenance_id']}' creado exitosamente para activo {res['equipment_tag']}.",
+        created_id=res["maintenance_id"],
+        entity_type="maintenance_plan",
+        data=res
+    )
 
 @router.get(
     "/history/{session_id}",

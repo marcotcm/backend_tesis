@@ -16,10 +16,9 @@ class FMEAAnalysis(Base):
 
     title = Column(String, nullable=False)
     status = Column(String, nullable=False, default="PENDIENTE")
-    severity = Column(Integer, nullable=False)
-    occurrence = Column(Integer, nullable=False)
-    detection = Column(Integer, nullable=False)
-    rpn_score = Column(Integer, nullable=False, default=0)
+    severity = Column(String, nullable=True)
+    frequency = Column(String, nullable=True)
+    detectability = Column(String, nullable=True)
 
     description = Column(Text, nullable=False)
     causes = Column(JSON, nullable=False, default=list)
