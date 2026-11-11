@@ -9,14 +9,18 @@ y provee un generador de sesiones para inyección de dependencias en FastAPI.
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy.pool import NullPool
 from core.config import settings
 
-# Creación del motor asíncrono optimizado para PostgreSQL
+# Creación del motor asíncrono con connection pooling reutilizable
+# Evita abrir y cerrar handshakes SSL en cada solicitud HTTP (~1.7s -> ~50ms)
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,  # Deshabilitado en entornos productivos para optimizar rendimiento de logs
-    poolclass=NullPool,  # Delega la gestión de conexiones al pooler de Supabase (PgBouncer/Supavisor)
+    pool_size=10,  # Conexiones persistentes abiertas en el pool
+    max_overflow=20,  # Conexiones adicionales permitidas bajo ráfagas de tráfico
+    pool_timeout=30,  # Tiempo máximo de espera para obtener una conexión del pool
+    pool_recycle=1800,  # Recicla conexiones cada 30 minutos para prevenir cortes de socket inactivo
+    pool_pre_ping=True,  # Verifica la vitalidad del socket antes de reutilizarlo
     connect_args={
         "server_settings": {"jit": "off"},  # Desactiva JIT para reducir la sobrecarga de memoria en consultas ligeras
         "command_timeout": 60  # Límite de tiempo en segundos para sentencias SQL
