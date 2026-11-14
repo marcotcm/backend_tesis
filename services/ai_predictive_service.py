@@ -290,7 +290,7 @@ async def ejecutar_analisis_predictivo_ia(
     try:
         # Llamada asíncrona a la API de Google GenAI
         respuesta = await client.aio.models.generate_content(
-            model="gemini-2.5-flash", # Mejor razonamiento para cruzar ML, telemetría y texto humano
+            model="gemini-3.1-flash-lite", # Mejor razonamiento para cruzar ML, telemetría y texto humano
             contents=contexto_tecnico,
             config=configuracion
         )
