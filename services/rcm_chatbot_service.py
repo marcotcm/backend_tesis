@@ -4,7 +4,8 @@ Servicio Central del Asistente Conversacional RCM (Chatbot) con Inteligencia Art
 Inspirado en la arquitectura modular de maxton_ai_back (BeautyAdvisorService / Controller)
 y adaptado al dominio de Mantenimiento Centrado en Confiabilidad (SAE JA1011, ISO 14224 e ISO 10816-3).
 Soporta creación física de Órdenes de Trabajo y Planes de Mantenimiento en PostgreSQL,
-propuestas de acción con 1 clic (Action Proposals) y dossiers técnicos exhaustivos por activo.
+propuestas de acción con 1 clic (Action Proposals), dossiers técnicos exhaustivos por activo,
+listado completo de Equipos Críticos (Clase A / RPN y Alertas ML) e integración con XGBoost.
 """
 
 import os
@@ -27,13 +28,22 @@ from models.equipment_metrics import EquipmentMetricHistory
 from models.fmea_analysis import FMEAAnalysis
 from models.equipment_criticality import EquipmentCriticality
 from models.failure_history import FailureHistory
+from models.maintenance_history import MaintenanceHistory
+from models.ai_recommendation import AIRecommendation
+from models.ai_correction import AICorrection
 from models.maintenance import Maintenance
 from models.work_orders import WorkOrder
 from models.user import User
 
+# Integración directa con la Capa 1 (Machine Learning XGBoost) y Radar Global de Planta
+from services.ai_predictive_service import (
+    evaluar_metrica_actual_ml,
+    evaluar_riesgo_global_planta,
+)
+
 logger = logging.getLogger("rcm_chatbot")
 
-# Modelos candidatos en orden de prioridad para cascada de alta disponibilidad
+# Modelos candidatos en orden de prioridad para cascada de alta disponibilidad (INTACTOS)
 CANDIDATE_MODELS = [
     "gemini-3.1-flash-lite",
     "gemini-flash-lite-latest",
@@ -70,12 +80,14 @@ TAG_ALIASES = {
     "EXP-101": "K-302",
 }
 
+
 class RcmChatbotService:
     """
     Servicio de Asesoría Técnica RCM y Diagnóstico Predictivo Inteligente.
     Gestiona el contexto conversacional, análisis multimodal (imágenes de componentes/placas),
-    inyección de telemetría de activos en tiempo real desde PostgreSQL,
-    generación de órdenes de trabajo físicas y planes de mantenimiento.
+    inyección de telemetría de activos en tiempo real desde PostgreSQL, inferencia ML (XGBoost),
+    radar global de planta y listado de equipos críticos, generación de órdenes de trabajo físicas
+    y planes de mantenimiento.
     """
 
     def __init__(self):
@@ -99,7 +111,8 @@ class RcmChatbotService:
         return (
             "Eres el Asistente de Inteligencia Artificial de Heimdall RCM, especializado en "
             "Mantenimiento Centrado en Confiabilidad (SAE JA1011), Taxonomía Petrolera (ISO 14224), "
-            "Severidad de Vibraciones Mecánicas (ISO 10816-3) y Gestión de Activos Industriales.\n\n"
+            "Severidad de Vibraciones Mecánicas (ISO 10816-3), Diagnóstico Predictivo con Machine Learning (XGBoost) "
+            "y Gestión de Activos Industriales.\n\n"
             "TUS FUNCIONES Y CAPACIDADES PRINCIPALES:\n"
             "1. Responder dudas metodológicas sobre RCM y las 7 preguntas de la norma SAE JA1011.\n"
             "2. Explicar el análisis de modos y efectos de falla (AMEF / FMEA) y el cálculo del Número de Prioridad de Riesgo (RPN = S x O x D).\n"
@@ -108,21 +121,27 @@ class RcmChatbotService:
             "   - Zona B (2.8 - 4.5 mm/s RMS): Operación normal admisible sin restricciones.\n"
             "   - Zona C (4.5 - 7.1 mm/s RMS): Alerta preventiva, deterioro incipiente, planificar intervención.\n"
             "   - Zona D (>7.1 mm/s RMS): Daño inminente, alarma crítica, parada obligatoria de inmediato.\n"
-            "4. CREACIÓN DIRECTA DE ÓRDENES DE TRABAJO Y PLANES:\n"
+            "4. LISTADO DE EQUIPOS CRÍTICOS, PREDICCIÓN DE FALLAS (XGBOOST) Y VISIÓN GLOBAL DE PLANTA:\n"
+            "   Tienes acceso al inventario completo de la planta con dos niveles de criticidad:\n"
+            "   a) Criticidad RCM por Matriz de Riesgo (Clase A / Crítico, Clase B / Semicrítico, Clase C / No Crítico y su RPN score).\n"
+            "   b) Criticidad Predictiva en Tiempo Real mediante el modelo XGBoost (Probabilidad de falla inminente <48h en %, alerta CRÍTICA >=70%, MODERADA >=40%, NORMAL <40%).\n"
+            "   Cuando el usuario pida listar los equipos críticos o con mayor riesgo de dañarse, presenta claramente ambas dimensiones (Criticidad RCM Clase A/RPN y Probabilidad de Falla ML) con sus métricas actuales.\n"
+            "5. CREACIÓN DIRECTA DE ÓRDENES DE TRABAJO Y PLANES:\n"
             "   Tienes la capacidad de crear físicamente Órdenes de Trabajo (OT) y Planes de Mantenimiento en la base de datos PostgreSQL.\n"
             "   Cuando el usuario te pida crear una OT o plan (ej. 'crea una orden de trabajo para K-201A por vibración alta'), confirma que la acción ha sido procesada.\n\n"
-            "5. CUANDO SE CONSULTE POR UN ACTIVO O MAQUINARIA ESPECÍFICA:\n"
+            "6. CUANDO SE CONSULTE POR UN ACTIVO O MAQUINARIA ESPECÍFICA:\n"
             "   DEBES EMITIR UN DOSSIER TÉCNICO DE INGENIERÍA EXHAUSTIVO Y DETALLADO ESTRUCTURADO EN 6 SECCIONES:\n"
             "   1. Ficha Técnica y Taxonomía del Activo (ISO 14224): TAG, nombre, clasificación, fabricante, modelo, estado y función primaria según SAE JA1011.\n"
-            "   2. Telemetría de Sensores y Condición Operativa en Tiempo Real: Vibración RMS en mm/s evaluada contra Zona A/B/C/D de ISO 10816-3, temperatura de cojinetes (°C), horas acumuladas y variables de proceso.\n"
-            "   3. Jerarquía de Criticidad y Matriz de Riesgo: Clase A/B/C y RPN score.\n"
+            "   2. Telemetría de Sensores, Predicción ML (XGBoost) y Condición en Tiempo Real: Probabilidad de falla inminente (<48h) en %, clasificación de alerta ML, salto de amperaje, vibración RMS en mm/s evaluada contra Zona A/B/C/D de ISO 10816-3, temperatura (°C), horas acumuladas y variables de proceso.\n"
+            "   3. Jerarquía de Criticidad, Historial Operativo y Matriz de Riesgo: Clase A/B/C, RPN score, días desde última falla, días desde último mantenimiento y eventos previos.\n"
             "   4. Análisis AMEF de Modos de Falla Dominantes (SAE JA1011): Modos de falla específicos según la tecnología del activo, causas raíz y consecuencias funcionales.\n"
             "   5. Estrategia y Acciones Prescriptivas RCM: Procedimientos técnicos paso a paso (alineación láser, lubricación con especificación, boroscopia, análisis FFT).\n"
             "   6. Propuesta de Acción Inmediata: Sugerencia concreta para emitir Orden de Trabajo o Plan Preventivo.\n\n"
             "DIRECTRICES DE COMUNICACIÓN:\n"
             "- Responde en español técnico, riguroso, formal y profesional.\n"
             "- NUNCA utilices emojis en telemetría técnica, diagnósticos ni reportes de alarma industrial.\n"
-            "- Utiliza los datos reales de telemetría y AMEF provistos en el contexto de base de datos.\n"
+            "- Utiliza siempre los datos reales de telemetría, predicción ML (XGBoost), criticidad RPN, historial de fallas/mantenimientos y AMEF provistos en el contexto de base de datos.\n"
+            "- Si existen correcciones humanas previas en el contexto que desestimen una alerta similar, respétalas.\n"
             "- Si el usuario envía una imagen, analiza si corresponde a una chapa técnica (extrae TAG, RPM, potencia), a una pieza con falla física o a un espectro de vibración."
         )
 
@@ -140,9 +159,127 @@ class RcmChatbotService:
             logger.warning(f"[RCM CHATBOT] No se pudo obtener usuario de BD ({e}), usando UUID por defecto.")
         return uuid.UUID("51bb07ab-7059-4fc6-afa0-54020251955a")
 
+    async def get_plant_global_context(self, db: AsyncSession) -> Optional[Dict[str, Any]]:
+        """
+        Obtiene el inventario completo de máquinas activas en la planta cruzando:
+        1. Probabilidad de falla del motor de Machine Learning (XGBoost).
+        2. Jerarquía de Criticidad RCM (EquipmentCriticality: Clase A/B/C, RPN e impactos).
+        3. Telemetría actual (vibración y temperatura).
+        """
+        if not db:
+            return None
+        try:
+            resumen_riesgo = await evaluar_riesgo_global_planta(db)
+
+            equipos_q = select(Equipment).where(
+                Equipment.is_active == True,
+                Equipment.deleted_at.is_(None)
+            ).order_by(Equipment.tag_number.asc())
+            equipos_orm = (await db.execute(equipos_q)).scalars().all()
+
+            # Cargar todas las criticidades en un diccionario para cruce rápido O(1)
+            crit_q = select(EquipmentCriticality)
+            crit_rows = (await db.execute(crit_q)).scalars().all()
+            crit_map = {c.equipment_id: c for c in crit_rows}
+
+            inventario_completo = []
+            equipos_criticos_rcm = []
+            equipos_criticos_ml = []
+
+            for eq in equipos_orm:
+                metricas_q = (
+                    select(EquipmentMetricHistory)
+                    .where(EquipmentMetricHistory.equipment_id == eq.id)
+                    .order_by(desc(EquipmentMetricHistory.recorded_at))
+                    .limit(50)
+                )
+                metricas_recientes = (await db.execute(metricas_q)).scalars().all()
+
+                fallas_q = (
+                    select(FailureHistory)
+                    .where(FailureHistory.equipment_id == eq.id)
+                    .order_by(desc(FailureHistory.failure_date))
+                    .limit(5)
+                )
+                ultimas_fallas = (await db.execute(fallas_q)).scalars().all()
+
+                maint_q = (
+                    select(MaintenanceHistory)
+                    .where(MaintenanceHistory.equipment_id == eq.id)
+                    .order_by(desc(MaintenanceHistory.execution_date))
+                    .limit(5)
+                )
+                ultimos_mantenimientos = (await db.execute(maint_q)).scalars().all()
+
+                ml_eval = evaluar_metrica_actual_ml(
+                    equipment=eq,
+                    metricas_orm=metricas_recientes,
+                    ultimas_fallas=ultimas_fallas,
+                    ultimos_mantenimientos=ultimos_mantenimientos
+                )
+
+                crit_obj = crit_map.get(eq.id)
+                crit_level = crit_obj.criticality_level if crit_obj and crit_obj.criticality_level else "Clase B (Semicrítico)"
+                rpn_score = int(crit_obj.rpn_score) if crit_obj and crit_obj.rpn_score is not None else 160
+
+                ultima_m = metricas_recientes[0] if metricas_recientes else None
+                vib_actual = float(ultima_m.vibration_mm_s) if ultima_m and ultima_m.vibration_mm_s is not None else None
+                temp_actual = float(ultima_m.temperature_celsius) if ultima_m and ultima_m.temperature_celsius is not None else None
+                prob_pct = round(ml_eval["probabilidad_falla"] * 100, 2)
+
+                # Determinar si es crítico por matriz RCM (Clase A o RPN >= 200) o por condición operativa (ML >= 40% o Vibración > 4.5)
+                crit_upper = crit_level.upper()
+                es_critico_rcm = ("CLASE A" in crit_upper) or ("CRÍTICO" in crit_upper and "SEMICRÍTICO" not in crit_upper and "NO CRÍTICO" not in crit_upper) or ("CRITICO" in crit_upper and "SEMICRITICO" not in crit_upper and "NO CRITICO" not in crit_upper) or (rpn_score >= 200)
+                es_critico_condicion = (prob_pct >= 40.0) or (vib_actual is not None and vib_actual > 4.5)
+
+                item_data = {
+                    "id": str(eq.id),
+                    "tag_number": eq.tag_number,
+                    "name": eq.name,
+                    "equipment_type": eq.equipment_type,
+                    "operational_status": eq.operational_status,
+                    "criticality_level": crit_level,
+                    "rpn_score": rpn_score,
+                    "es_critico_rcm": es_critico_rcm,
+                    "es_critico_condicion": es_critico_condicion,
+                    "probabilidad_falla_pct": prob_pct,
+                    "clasificacion_alerta_ml": ml_eval["clasificacion_alerta"],
+                    "salto_amperaje": ml_eval["salto_amperaje"],
+                    "vibration_mm_s": vib_actual,
+                    "temperature_celsius": temp_actual,
+                    "dias_ultima_falla": ml_eval["dias_ultima_falla"],
+                    "dias_ultimo_mantenimiento": ml_eval["dias_ultimo_mantenimiento"],
+                }
+
+                inventario_completo.append(item_data)
+                if es_critico_rcm:
+                    equipos_criticos_rcm.append(item_data)
+                if es_critico_condicion:
+                    equipos_criticos_ml.append(item_data)
+
+            # Ordenar por probabilidad de falla ML descendente y luego por RPN descendente
+            inventario_completo.sort(key=lambda x: (x["probabilidad_falla_pct"], x["rpn_score"]), reverse=True)
+            equipos_criticos_rcm.sort(key=lambda x: (x["rpn_score"], x["probabilidad_falla_pct"]), reverse=True)
+            equipos_criticos_ml.sort(key=lambda x: (x["probabilidad_falla_pct"], x["rpn_score"]), reverse=True)
+
+            return {
+                "total_analizados": resumen_riesgo.get("total_analizados", len(inventario_completo)),
+                "equipos_sanos": resumen_riesgo.get("equipos_sanos", 0),
+                "equipos_en_riesgo_count": len(equipos_criticos_ml),
+                "equipos_criticos_rcm_count": len(equipos_criticos_rcm),
+                "alertas_criticas": resumen_riesgo.get("alertas", []),
+                "equipos_criticos_rcm": equipos_criticos_rcm,
+                "equipos_criticos_ml": equipos_criticos_ml,
+                "inventario_planta": inventario_completo,
+            }
+        except Exception as e:
+            logger.error(f"[RCM CHATBOT] Error obteniendo contexto global de planta: {e}")
+            return None
+
     async def get_equipment_db_context(self, db: AsyncSession, identifier: str) -> Optional[Dict[str, Any]]:
         """
-        Recupera información técnica, últimas métricas de sensores y AMEFs
+        Recupera información técnica, últimas 50 métricas de sensores, predicción ML (XGBoost),
+        historial de fallas, mantenimientos ejecutados, correcciones humanas y AMEFs
         asociados a un TAG o UUID de equipo desde PostgreSQL.
         """
         if not db or not identifier:
@@ -184,17 +321,54 @@ class RcmChatbotService:
             if not eq:
                 return None
 
-            # 4. Obtener última lectura de métricas
+            # 4. Obtener últimas 50 lecturas de métricas (necesarias para medias móviles de 12h en XGBoost)
             metric_q = (
                 select(EquipmentMetricHistory)
                 .where(EquipmentMetricHistory.equipment_id == eq.id)
                 .order_by(desc(EquipmentMetricHistory.recorded_at))
-                .limit(1)
+                .limit(50)
             )
             metric_res = await db.execute(metric_q)
-            latest_metric = metric_res.scalars().first()
+            metricas_recientes = metric_res.scalars().all()
+            latest_metric = metricas_recientes[0] if metricas_recientes else None
 
-            # 5. Obtener estudios AMEF aprobados o recientes
+            # 5. Obtener historial de fallas reales (últimas 5)
+            failures_q = (
+                select(FailureHistory)
+                .where(FailureHistory.equipment_id == eq.id)
+                .order_by(desc(FailureHistory.failure_date))
+                .limit(5)
+            )
+            ultimas_fallas = (await db.execute(failures_q)).scalars().all()
+
+            # 6. Obtener historial de mantenimientos ejecutados (últimos 5)
+            maint_hist_q = (
+                select(MaintenanceHistory)
+                .where(MaintenanceHistory.equipment_id == eq.id)
+                .order_by(desc(MaintenanceHistory.execution_date))
+                .limit(5)
+            )
+            ultimos_mantenimientos = (await db.execute(maint_hist_q)).scalars().all()
+
+            # 7. Evaluar el modelo predictivo de Machine Learning (XGBoost)
+            resultado_ml = evaluar_metrica_actual_ml(
+                equipment=eq,
+                metricas_orm=metricas_recientes,
+                ultimas_fallas=ultimas_fallas,
+                ultimos_mantenimientos=ultimos_mantenimientos
+            )
+
+            # 8. Obtener Feedback Loop (Correcciones de auditores humanos e IA previa)
+            correcciones_q = (
+                select(AICorrection, AIRecommendation)
+                .join(AIRecommendation, AICorrection.recommendation_id == AIRecommendation.id)
+                .where(AIRecommendation.equipment_id == eq.id)
+                .order_by(desc(AICorrection.created_at))
+                .limit(3)
+            )
+            correcciones_rows = (await db.execute(correcciones_q)).all()
+
+            # 9. Obtener estudios AMEF aprobados o recientes
             fmea_q = (
                 select(FMEAAnalysis)
                 .where(FMEAAnalysis.equipment_id == eq.id)
@@ -204,7 +378,7 @@ class RcmChatbotService:
             fmea_res = await db.execute(fmea_q)
             fmeas = fmea_res.scalars().all()
 
-            # 6. Obtener criticidad
+            # 10. Obtener criticidad completa
             crit_q = select(EquipmentCriticality).where(EquipmentCriticality.equipment_id == eq.id)
             crit_res = await db.execute(crit_q)
             crit = crit_res.scalars().first()
@@ -215,12 +389,27 @@ class RcmChatbotService:
                 "name": eq.name,
                 "equipment_type": eq.equipment_type,
                 "operational_status": eq.operational_status,
+                "usage_time": float(eq.usage_time) if getattr(eq, "usage_time", None) is not None else 1840.0,
                 "brand": eq.brand or "Industrial Certificado",
                 "model": eq.model or "API 610/618",
                 "function_description": eq.function_description or "Operación continua de procesamiento y transporte de hidrocarburos.",
                 "specs": eq.technical_specifications or {},
                 "criticality": crit.criticality_level if crit else "Clase B (Semicrítico)",
                 "rpn_score": crit.rpn_score if crit else 160,
+                "criticality_breakdown": {
+                    "safety": getattr(crit, "safety_impact_score", None),
+                    "environmental": getattr(crit, "environmental_impact_score", None),
+                    "operational": getattr(crit, "operational_impact_score", None),
+                    "cost": getattr(crit, "maintenance_cost_score", None),
+                } if crit else None,
+                "ml_prediction": {
+                    "probabilidad_falla": resultado_ml["probabilidad_falla"],
+                    "probabilidad_falla_pct": round(resultado_ml["probabilidad_falla"] * 100, 2),
+                    "clasificacion_alerta": resultado_ml["clasificacion_alerta"],
+                    "salto_amperaje": resultado_ml["salto_amperaje"],
+                    "dias_ultima_falla": resultado_ml["dias_ultima_falla"],
+                    "dias_ultimo_mantenimiento": resultado_ml["dias_ultimo_mantenimiento"],
+                },
                 "latest_metric": {
                     "vibration_mm_s": float(latest_metric.vibration_mm_s) if latest_metric and latest_metric.vibration_mm_s is not None else 5.2,
                     "temperature_celsius": float(latest_metric.temperature_celsius) if latest_metric and latest_metric.temperature_celsius is not None else 78.5,
@@ -229,6 +418,40 @@ class RcmChatbotService:
                     "notes": latest_metric.notes if latest_metric else "Inspección rutinaria de sensores por condición.",
                     "recorded_at": latest_metric.recorded_at.isoformat() if latest_metric else datetime.now(timezone.utc).isoformat()
                 },
+                "recent_telemetry_trend": [
+                    {
+                        "recorded_at": m.recorded_at.isoformat() if m.recorded_at else "",
+                        "temperature_celsius": float(m.temperature_celsius) if m.temperature_celsius is not None else 0.0,
+                        "vibration_mm_s": float(m.vibration_mm_s) if m.vibration_mm_s is not None else 0.0,
+                        "specific_metrics": m.specific_metrics or {}
+                    }
+                    for m in metricas_recientes[:6]
+                ],
+                "failure_history": [
+                    {
+                        "failure_date": f.failure_date.isoformat() if getattr(f, "failure_date", None) else "N/D",
+                        "failure_mode": getattr(f, "failure_mode", "N/D"),
+                        "severity": getattr(f, "severity", "N/D"),
+                        "downtime_hours": float(getattr(f, "downtime_hours", 0.0) or 0.0),
+                        "description": getattr(f, "description", "")
+                    }
+                    for f in ultimas_fallas
+                ],
+                "maintenance_history": [
+                    {
+                        "execution_date": m.execution_date.isoformat() if getattr(m, "execution_date", None) else "N/D",
+                        "action_taken": getattr(m, "action_taken", "N/D"),
+                        "replaced_parts": getattr(m, "replaced_parts", "Ninguno")
+                    }
+                    for m in ultimos_mantenimientos
+                ],
+                "human_corrections": [
+                    {
+                        "original_prediction": rec.prediction_type,
+                        "corrected_text": corr.corrected_text
+                    }
+                    for corr, rec in correcciones_rows
+                ],
                 "fmeas": [
                     {
                         "title": f.title,
@@ -266,25 +489,68 @@ class RcmChatbotService:
             if alias in text_upper:
                 return canon
 
-        # 3. Detección por palabras clave tecnológicas
-        if "BCP" in text_upper or "CAVIDAD PROGRESIVA" in text_upper:
-            return "P-501A"
-        if "BES" in text_upper or "ELECTROSUMERGIBLE" in text_upper:
-            return "P-601"
-        if "COMPRESOR" in text_upper or "RECIPROCANTE" in text_upper:
-            return "K-201A"
-        if "OLEODUCTO" in text_upper or "BOMBA MULTIETAPA" in text_upper:
-            return "P-401A"
-        if "SEPARADOR" in text_upper or "TRIFASICO" in text_upper or "SEDIMENTADOR" in text_upper:
-            return "TK-103"
-        if "TANQUE" in text_upper or "CRUDO" in text_upper:
-            return "TK-101"
-        if "GLP" in text_upper or "BALA" in text_upper:
-            return "TK-104"
-        if "BOMBA" in text_upper:
-            return "BOMBA-CENTRIFUGA-01"
+        # 3. Patrón genérico de TAG industrial (ej. P-101, K-500, TK-200)
+        generic_tag_match = re.search(r"\b(TK|CMP|BOM|P|K)-\d{2,4}[A-Z]?\b", text_upper)
+        if generic_tag_match:
+            return generic_tag_match.group(0)
+
+        # 4. Detección por palabras clave tecnológicas (solo si no es una consulta global de equipos)
+        if not self._is_global_plant_query(text):
+            if "BCP" in text_upper or "CAVIDAD PROGRESIVA" in text_upper:
+                return "P-501A"
+            if "BES" in text_upper or "ELECTROSUMERGIBLE" in text_upper:
+                return "P-601"
+            if "COMPRESOR" in text_upper or "RECIPROCANTE" in text_upper:
+                return "K-201A"
+            if "OLEODUCTO" in text_upper or "BOMBA MULTIETAPA" in text_upper:
+                return "P-401A"
+            if "SEPARADOR" in text_upper or "TRIFASICO" in text_upper or "SEDIMENTADOR" in text_upper:
+                return "TK-103"
+            if "TANQUE" in text_upper or "CRUDO" in text_upper:
+                return "TK-101"
+            if "GLP" in text_upper or "BALA" in text_upper:
+                return "TK-104"
+            if "BOMBA" in text_upper:
+                return "BOMBA-CENTRIFUGA-01"
 
         return None
+
+    async def _resolve_dynamic_tag_from_db(self, db: AsyncSession, text: str) -> Optional[str]:
+        """Busca si el mensaje menciona el tag_number o nombre exacto de algún equipo registrado en BD."""
+        if not db or not text:
+            return None
+        try:
+            text_upper = text.upper()
+            q = select(Equipment.tag_number, Equipment.name).where(
+                Equipment.is_active == True,
+                Equipment.deleted_at.is_(None)
+            )
+            rows = (await db.execute(q)).all()
+            for tag_num, eq_name in rows:
+                if tag_num and tag_num.upper() in text_upper:
+                    return tag_num
+                if eq_name and len(eq_name) > 5 and eq_name.upper() in text_upper:
+                    return tag_num
+        except Exception as e:
+            logger.warning(f"[RCM CHATBOT] No se pudo resolver tag dinámico en BD: {e}")
+        return None
+
+    def _is_global_plant_query(self, message: str) -> bool:
+        """Determina si el usuario está consultando por todas las máquinas, equipos críticos, riesgo global o probabilidades de daño."""
+        msg_low = message.lower()
+        keywords = [
+            "todas las maquinas", "todas las máquinas", "todos los equipos", "todos los activos",
+            "estado de la planta", "riesgo global", "probabilidad de que algo se dane",
+            "probabilidad de que algo se dañe", "que maquina se va a danar", "qué máquina se va a dañar",
+            "cuales estan en riesgo", "cuáles están en riesgo", "equipos en alerta",
+            "equipos criticos", "equipos críticos", "maquinas criticas", "máquinas críticas",
+            "activos criticos", "activos críticos", "listar criticos", "listar críticos",
+            "lista de equipos", "lista de maquinas", "lista de máquinas", "clase a",
+            "mayor rpn", "ranking de criticidad", "matriz de criticidad",
+            "resumen de planta", "inventario de maquinas", "inventario de equipos",
+            "probabilidad de falla", "prediccion", "predicción", "se dane", "se dañe"
+        ]
+        return any(k in msg_low for k in keywords)
 
     async def create_work_order_from_chat(
         self,
@@ -335,12 +601,15 @@ class RcmChatbotService:
         # Crear WorkOrder física
         priority_valid = priority if priority in ["Baja", "Normal", "Alta", "Urgente"] else "Alta"
         m = eq_context.get("latest_metric") or {}
+        ml_info = eq_context.get("ml_prediction") or {}
         vib = m.get("vibration_mm_s")
+        prob_pct = ml_info.get("probabilidad_falla_pct", 0.0)
         notes = (
             technician_notes
             or f"Orden de trabajo generada automáticamente por el Copiloto Heimdall RCM. "
             f"Motivo: {title}. "
-            f"Severidad de vibración registrada: {vib if vib is not None else 'N/D'} mm/s RMS."
+            f"Severidad de vibración registrada: {vib if vib is not None else 'N/D'} mm/s RMS. "
+            f"Probabilidad de falla ML (XGBoost): {prob_pct}%."
         )
 
         wo = WorkOrder(
@@ -436,16 +705,25 @@ class RcmChatbotService:
     ) -> Dict[str, Any]:
         """
         Procesa la consulta técnica del usuario integrando historial, telemetría de BD,
+        inferencia ML (XGBoost), escaneo global de planta y equipos críticos,
         ejecución conversacional de órdenes/planes y análisis multimodal.
         """
         session_id = session_id or self.generate_session_id()
         history = self.conversations.get(session_id, [])
 
-        # 1. Resolver activo mencionado o seleccionado
+        # 1. Resolver activo mencionado o seleccionado (estático + dinámico desde BD)
         target_tag = equipment_id or self._extract_tag_from_text(message)
+        if not target_tag and db and not self._is_global_plant_query(message):
+            target_tag = await self._resolve_dynamic_tag_from_db(db, message)
+
         eq_context = None
         if db and target_tag:
             eq_context = await self.get_equipment_db_context(db, target_tag)
+
+        # 1.b Si el usuario pregunta por equipos críticos, todas las máquinas o riesgo de daño
+        plant_global_context = None
+        if db and (not eq_context or self._is_global_plant_query(message)):
+            plant_global_context = await self.get_plant_global_context(db)
 
         # 2. Detección de intenciones de CREACIÓN directa
         wo_match = re.search(
@@ -578,14 +856,16 @@ class RcmChatbotService:
             # Construir Action Proposal interactivo si se detecta un activo
             if eq_context:
                 m = eq_context.get("latest_metric") or {}
+                ml_pred = eq_context.get("ml_prediction") or {}
                 vib = m.get("vibration_mm_s")
                 temp = m.get("temperature_celsius")
                 crit_rpn = eq_context.get("rpn_score") or 0
+                prob_ml = ml_pred.get("probabilidad_falla", 0.0)
 
                 prio = "Normal"
-                if (vib and vib > 7.1) or (temp and temp > 85):
+                if (vib and vib > 7.1) or (temp and temp > 85) or (prob_ml >= 0.70):
                     prio = "Urgente"
-                elif (vib and vib > 4.5) or (temp and temp > 70) or (crit_rpn >= 150):
+                elif (vib and vib > 4.5) or (temp and temp > 70) or (crit_rpn >= 150) or (prob_ml >= 0.40):
                     prio = "Alta"
 
                 action_proposal = {
@@ -595,7 +875,10 @@ class RcmChatbotService:
                     "equipment_name": eq_context["name"],
                     "title": f"Inspección RCM {'Urgente' if prio == 'Urgente' else 'Preventiva'} - {eq_context['tag_number']}",
                     "priority": prio,
-                    "description": f"Rutina de inspección y mitigación técnica para {eq_context['tag_number']} ({eq_context['name']}) por condición operativa ({vib or 'N/D'} mm/s RMS).",
+                    "description": (
+                        f"Rutina de inspección y mitigación técnica para {eq_context['tag_number']} ({eq_context['name']}) "
+                        f"por condición operativa ({vib or 'N/D'} mm/s RMS | Riesgo ML: {ml_pred.get('probabilidad_falla_pct', 0)}%)."
+                    ),
                     "suggested_frequency_days": 15 if prio in ["Urgente", "Alta"] else 30
                 }
 
@@ -603,15 +886,23 @@ class RcmChatbotService:
             if current_user_info:
                 full_prompt += f"USUARIO CONSULTANTE: {current_user_info}\n\n"
 
+            # Inyectar el contexto específico del equipo con telemetría + ML + historial completo
             if eq_context:
+                ml_p = eq_context.get("ml_prediction") or {}
                 full_prompt += (
-                    "--- TELEMETRÍA Y CONTEXTO EN VIVO DEL ACTIVO (BASE DE DATOS HEIMDALL) ---\n"
+                    "--- TELEMETRÍA, PREDICCIÓN ML (XGBOOST) Y CONTEXTO EN VIVO DEL ACTIVO ---\n"
                     f"TAG: {eq_context['tag_number']} ({eq_context['name']})\n"
                     f"Tipo: {eq_context['equipment_type']} | Estado Operacional: {eq_context['operational_status']}\n"
                     f"Fabricante / Modelo: {eq_context.get('brand')} / {eq_context.get('model')}\n"
-                    f"Criticidad: {eq_context['criticality']} (RPN: {eq_context['rpn_score']})\n"
+                    f"Criticidad RCM: {eq_context['criticality']} (RPN: {eq_context['rpn_score']})\n"
                     f"Función Primaria: {eq_context['function_description']}\n"
-                    f"Especificaciones Técnicas: {eq_context.get('specs')}\n"
+                    f"Especificaciones Técnicas: {eq_context.get('specs')}\n\n"
+                    f"RESULTADO DEL MODELO PREDICTIVO DE MACHINE LEARNING (XGBOOST MULTI-EQUIPO):\n"
+                    f"  - Probabilidad de Falla Inminente (<48h): {ml_p.get('probabilidad_falla_pct')}%\n"
+                    f"  - Clasificación de Alerta ML: {ml_p.get('clasificacion_alerta')}\n"
+                    f"  - Salto de Amperaje (Delta): {ml_p.get('salto_amperaje')} A\n"
+                    f"  - Días desde última falla: {ml_p.get('dias_ultima_falla')} días\n"
+                    f"  - Días desde último mantenimiento: {ml_p.get('dias_ultimo_mantenimiento')} días\n\n"
                 )
                 if eq_context.get("latest_metric"):
                     m = eq_context["latest_metric"]
@@ -621,12 +912,71 @@ class RcmChatbotService:
                         f"  - Temperatura: {m.get('temperature_celsius')} °C\n"
                         f"  - Horas Operación: {m.get('operating_hours')} hrs\n"
                         f"  - Variables de Proceso: {m.get('specific_metrics')}\n"
-                        f"  - Notas de Inspección: {m.get('notes')}\n"
+                        f"  - Notas de Inspección: {m.get('notes')}\n\n"
                     )
+                if eq_context.get("failure_history"):
+                    full_prompt += "Historial Reciente de Fallas Reales:\n"
+                    for fh in eq_context["failure_history"]:
+                        full_prompt += f"  * {fh['failure_date']} | Modo: {fh['failure_mode']} | Severidad: {fh['severity']} | Parada: {fh['downtime_hours']}h | {fh['description']}\n"
+                    full_prompt += "\n"
+                if eq_context.get("maintenance_history"):
+                    full_prompt += "Historial Reciente de Mantenimientos Ejecutados:\n"
+                    for mh in eq_context["maintenance_history"]:
+                        full_prompt += f"  * {mh['execution_date']} | Acción: {mh['action_taken']} | Repuestos: {mh['replaced_parts']}\n"
+                    full_prompt += "\n"
+                if eq_context.get("human_corrections"):
+                    full_prompt += "Correcciones Previas de Auditores Humanos (Feedback Loop):\n"
+                    for hc in eq_context["human_corrections"]:
+                        full_prompt += f"  * Alerta previa '{hc['original_prediction']}' corregida por experto: '{hc['corrected_text']}'\n"
+                    full_prompt += "\n"
                 if eq_context.get("fmeas"):
                     full_prompt += "Modos de Falla Registrados (AMEF):\n"
                     for f in eq_context["fmeas"]:
                         full_prompt += f"  * {f['title']} (Severidad: {f.get('severity')}, Frecuencia: {f.get('frequency')})\n"
+                full_prompt += "------------------------------------------------------------\n\n"
+
+            # Inyectar también el radar global de planta y listado de equipos críticos
+            if plant_global_context:
+                full_prompt += (
+                    "--- PANORAMA GLOBAL DE PLANTA Y LISTADO DE EQUIPOS CRÍTICOS (RCM + ML XGBOOST) ---\n"
+                    f"Total de Equipos Activos Analizados: {plant_global_context['total_analizados']}\n"
+                    f"Equipos Críticos por Matriz RCM (Clase A / RPN >= 200): {plant_global_context['equipos_criticos_rcm_count']}\n"
+                    f"Equipos Críticos por Condición Predictiva ML (>=40% prob. falla o alta vibración): {plant_global_context['equipos_en_riesgo_count']}\n"
+                    f"Equipos en Operación Normal: {plant_global_context['equipos_sanos']}\n\n"
+                    "1. EQUIPOS CRÍTICOS POR CONDICIÓN OPERATIVA / RIESGO DE FALLA INMINENTE (XGBOOST):\n"
+                )
+                crit_ml_list = plant_global_context.get("equipos_criticos_ml", [])
+                if crit_ml_list:
+                    for item in crit_ml_list:
+                        full_prompt += (
+                            f"  * TAG: {item['tag_number']} ({item['name']}) | Criticidad RCM: {item['criticality_level']} (RPN: {item['rpn_score']}) | "
+                            f"Probabilidad Falla ML (<48h): {item['probabilidad_falla_pct']}% [{item['clasificacion_alerta_ml']}] | "
+                            f"Vibración: {item['vibration_mm_s']} mm/s | Temp: {item['temperature_celsius']} °C\n"
+                        )
+                else:
+                    full_prompt += "  * Ningún equipo supera actualmente el umbral de riesgo predictivo ML (>=40%).\n"
+
+                full_prompt += "\n2. EQUIPOS CRÍTICOS POR JERARQUÍA RCM (CLASE A / ALTO IMPACTO OPERACIONAL Y RPN):\n"
+                crit_rcm_list = plant_global_context.get("equipos_criticos_rcm", [])
+                if crit_rcm_list:
+                    for item in crit_rcm_list:
+                        full_prompt += (
+                            f"  * TAG: {item['tag_number']} ({item['name']}) | Nivel: {item['criticality_level']} (RPN: {item['rpn_score']}) | "
+                            f"Probabilidad Falla ML: {item['probabilidad_falla_pct']}% [{item['clasificacion_alerta_ml']}] | "
+                            f"Vibración: {item['vibration_mm_s']} mm/s | Temp: {item['temperature_celsius']} °C\n"
+                        )
+                else:
+                    full_prompt += "  * No hay activos catalogados explícitamente como Clase A en este momento.\n"
+
+                full_prompt += "\n3. INVENTARIO COMPLETO DE ACTIVOS DE LA PLANTA:\n"
+                for item in plant_global_context.get("inventario_planta", []):
+                    full_prompt += (
+                        f"  - TAG: {item['tag_number']} ({item['name']}) | Tipo: {item['equipment_type']} | "
+                        f"Criticidad RCM: {item['criticality_level']} (RPN: {item['rpn_score']}) | "
+                        f"Probabilidad Falla ML (<48h): {item['probabilidad_falla_pct']}% [{item['clasificacion_alerta_ml']}] | "
+                        f"Vibración: {item['vibration_mm_s']} mm/s | Temp: {item['temperature_celsius']} °C | "
+                        f"Días últ. falla: {item['dias_ultima_falla']}d | Días últ. mant.: {item['dias_ultimo_mantenimiento']}d\n"
+                    )
                 full_prompt += "------------------------------------------------------------\n\n"
 
             if history:
@@ -645,7 +995,7 @@ class RcmChatbotService:
             # Motor determinista de contingencia si no hubo respuesta de la API externa
             if not response_text:
                 logger.info("[RCM CHATBOT] Utilizando motor experto determinista de contingencia RCM.")
-                response_text = self._fallback_rcm_engine(message, eq_context)
+                response_text = self._fallback_rcm_engine(message, eq_context, plant_global_context)
 
         # 4. Actualizar memoria conversacional
         history.append({"role": "usuario", "content": message or "[Imagen adjunta]"})
@@ -664,6 +1014,7 @@ class RcmChatbotService:
             "session_id": session_id,
             "suggestions": suggestions,
             "detected_equipment": eq_context,
+            "plant_summary": plant_global_context if self._is_global_plant_query(message) else None,
             "rcm_data": rcm_data,
             "action_proposal": action_proposal,
             "action_executed": action_executed,
@@ -719,7 +1070,7 @@ class RcmChatbotService:
     def _format_equipment_deep_dossier(self, eq_context: Dict[str, Any]) -> str:
         """
         Genera un dossier técnico de ingeniería exhaustivo para el activo bajo normas
-        ISO 14224, ISO 10816-3 y SAE JA1011.
+        ISO 14224, ISO 10816-3, SAE JA1011 y modelo predictivo XGBoost.
         """
         tag = eq_context['tag_number']
         name = eq_context['name']
@@ -733,11 +1084,18 @@ class RcmChatbotService:
         rpn = eq_context.get('rpn_score') or 'N/D'
 
         m = eq_context.get('latest_metric') or {}
+        ml_pred = eq_context.get('ml_prediction') or {}
         vib = m.get('vibration_mm_s')
         temp = m.get('temperature_celsius')
         hours = m.get('operating_hours')
         rec_at = m.get('recorded_at') or 'Reciente'
         specifics = m.get('specific_metrics') or {}
+
+        prob_pct = ml_pred.get('probabilidad_falla_pct', 0.0)
+        alerta_ml = ml_pred.get('clasificacion_alerta', 'NORMAL')
+        salto_amp = ml_pred.get('salto_amperaje', 0.0)
+        dias_falla = ml_pred.get('dias_ultima_falla', 'N/D')
+        dias_maint = ml_pred.get('dias_ultimo_mantenimiento', 'N/D')
 
         # Evaluación de vibración ISO 10816-3
         if vib is not None:
@@ -761,6 +1119,11 @@ class RcmChatbotService:
             vib_zona = "No disponible en PostgreSQL"
             vib_diagnostico = "Sin lecturas recientes de vibración registrada en el historial de sensores."
             nivel_alerta = "Normal"
+
+        if prob_pct >= 70.0:
+            nivel_alerta = "Urgente"
+        elif prob_pct >= 40.0 and nivel_alerta not in ["Urgente"]:
+            nivel_alerta = "Alta"
 
         tag_upper = tag.upper()
         name_upper = name.upper()
@@ -831,17 +1194,20 @@ class RcmChatbotService:
             f"- **Estado Operacional en BDD**: `{status}`\n"
             f"- **Función Primaria (SAE JA1011)**: {func_desc}\n"
             + (f"- **Especificaciones de Diseño**: `{specs}`\n" if specs else "") +
-            f"\n#### 2. Telemetría de Sensores y Condición Operativa en Tiempo Real\n"
+            f"\n#### 2. Telemetría de Sensores, Predicción ML (XGBoost) y Condición en Tiempo Real\n"
+            f"- **Probabilidad de Falla Inminente (<48h - Modelo XGBoost)**: `{prob_pct}%` (**{alerta_ml}**)\n"
+            f"- **Salto Abrupto de Amperaje (Delta)**: `{salto_amp} A`\n"
             f"- **Severidad Vibratoria (ISO 10816-3)**: `{vib_zona}`\n"
             f"  * *Diagnóstico*: {vib_diagnostico}\n"
             f"- **Temperatura de Operación**: `{temp} °C`" + (" (Alerta térmica)" if temp and temp > 75 else " (Normal)") + "\n"
             f"- **Horas de Operación Acumuladas**: `{hours or 'N/D'} hrs`\n"
             f"- **Último Registro de Sensores**: `{rec_at}`\n"
             + (f"- **Variables de Proceso**: `{specifics}`\n" if specifics else "") +
-            f"\n#### 3. Jerarquía de Criticidad y Matriz de Riesgo\n"
+            f"\n#### 3. Jerarquía de Criticidad, Historial y Matriz de Riesgo\n"
             f"- **Nivel de Criticidad**: **{criticality}**\n"
             f"- **Número de Prioridad de Riesgo (RPN / NPR)**: `{rpn}`\n"
-            f"- **Nivel de Alerta Actual**: **{nivel_alerta}**\n\n"
+            f"- **Tiempo desde Última Falla**: `{dias_falla} días` | **Tiempo desde Último Mantenimiento**: `{dias_maint} días`\n"
+            f"- **Nivel de Alerta Integrado**: **{nivel_alerta}**\n\n"
             f"#### 4. Análisis AMEF de Modos de Falla Dominantes (SAE JA1011)\n"
             f"{amef_tech}\n\n"
             f"#### 5. Estrategia y Acciones Prescriptivas de Mantenimiento RCM\n"
@@ -852,16 +1218,72 @@ class RcmChatbotService:
             f"Puede generarla directamente pulsando el botón inferior o solicitando: *'Crea una orden de trabajo para {tag}'*."
         )
 
-    def _fallback_rcm_engine(self, message: str, eq_context: Optional[Dict[str, Any]]) -> str:
+    def _fallback_rcm_engine(
+        self,
+        message: str,
+        eq_context: Optional[Dict[str, Any]],
+        plant_global_context: Optional[Dict[str, Any]] = None
+    ) -> str:
         """
-        Motor experto determinista de alta precisión basado en SAE JA1011, ISO 14224 e ISO 10816.
+        Motor experto determinista de alta precisión basado en SAE JA1011, ISO 14224, ISO 10816 y XGBoost.
         Garantiza respuesta inmediata y exhaustiva si la API externa experimenta latencia.
         """
         clean = message.lower()
 
-        # Si se identificó un activo en el contexto, emitir el dossier técnico completo
-        if eq_context:
+        # Si se identificó un activo específico en el contexto, emitir el dossier técnico completo con ML
+        if eq_context and not self._is_global_plant_query(message):
             return self._format_equipment_deep_dossier(eq_context)
+
+        # Si pregunta por los equipos críticos, todas las máquinas o probabilidad global de daño en planta
+        if plant_global_context and (self._is_global_plant_query(message) or not eq_context):
+            crit_ml = plant_global_context.get("equipos_criticos_ml", [])
+            crit_rcm = plant_global_context.get("equipos_criticos_rcm", [])
+
+            bloque_ml = ""
+            if crit_ml:
+                for item in crit_ml:
+                    bloque_ml += (
+                        f"- **`{item['tag_number']}` ({item['name']})**: "
+                        f"Riesgo ML: **`{item['probabilidad_falla_pct']}%`** (`{item['clasificacion_alerta_ml']}`) | "
+                        f"Criticidad RCM: `{item['criticality_level']}` (RPN: `{item['rpn_score']}`) | "
+                        f"Vib: `{item['vibration_mm_s']} mm/s` | Temp: `{item['temperature_celsius']} °C`\n"
+                    )
+            else:
+                bloque_ml = "- Ningún activo presenta alerta de falla inminente (>= 40%) en este instante.\n"
+
+            bloque_rcm = ""
+            if crit_rcm:
+                for item in crit_rcm:
+                    bloque_rcm += (
+                        f"- **`{item['tag_number']}` ({item['name']})**: "
+                        f"Jerarquía: **`{item['criticality_level']}`** (RPN: **`{item['rpn_score']}`**) | "
+                        f"Probabilidad Falla ML: `{item['probabilidad_falla_pct']}%` | "
+                        f"Vib: `{item['vibration_mm_s']} mm/s` | Temp: `{item['temperature_celsius']} °C`\n"
+                    )
+            else:
+                bloque_rcm = "- No se registran activos bajo clasificación Clase A en la matriz actual.\n"
+
+            bloque_todos = ""
+            for item in plant_global_context.get("inventario_planta", []):
+                bloque_todos += (
+                    f"- **`{item['tag_number']}` ({item['name']})**: "
+                    f"Criticidad: `{item['criticality_level']}` (RPN `{item['rpn_score']}`) | "
+                    f"Riesgo ML: **`{item['probabilidad_falla_pct']}%`** (`{item['clasificacion_alerta_ml']}`)\n"
+                )
+
+            return (
+                "### INFORME DE EQUIPOS CRÍTICOS Y RADAR PREDICTIVO DE PLANTA\n\n"
+                f"- **Total de Máquinas Activas**: `{plant_global_context['total_analizados']}`\n"
+                f"- **Equipos Críticos por Matriz RCM (Clase A / Alto RPN)**: `{plant_global_context['equipos_criticos_rcm_count']}`\n"
+                f"- **Equipos Críticos por Condición Predictiva ML (Riesgo >= 40%)**: `{plant_global_context['equipos_en_riesgo_count']}`\n\n"
+                "#### 1. Equipos Críticos por Condición Operativa y Riesgo de Daño Inminente (XGBoost <48h)\n"
+                f"{bloque_ml}\n"
+                "#### 2. Equipos Críticos por Matriz de Riesgo RCM (Clase A / Impacto en Planta)\n"
+                f"{bloque_rcm}\n"
+                "#### 3. Resumen General del Inventario de Planta\n"
+                f"{bloque_todos}\n"
+                "Para abrir el dossier de ingeniería o crear una Orden de Trabajo sobre cualquier equipo crítico, indique su TAG (ejemplo: *'Crea una orden de trabajo urgente para K-201A'*)."
+            )
 
         # Caso 1: Definición de RCM y las 7 preguntas
         if any(k in clean for k in ["que es rcm", "significa rcm", "metodologia rcm", "ja1011", "7 preguntas"]):
@@ -912,15 +1334,10 @@ class RcmChatbotService:
         return (
             f"**Asistente Técnico Heimdall RCM**\n\n"
             f"Para su consulta sobre *'{message}'*:\n\n"
-            "El sistema de confiabilidad industrial recomienda estructurar el análisis bajo los principios de **SAE JA1011** e **ISO 14224**:\n"
-            "1. **Identificación del Activo**: Seleccione o mencione el TAG del equipo (ejemplo: `K-201A`, `P-501A`, `CMP-001`, `BCP-204`, `TK-101`) para consultar su telemetría en vivo.\n"
-            "2. **Monitoreo por Condición**: Verifique los espectros de vibración ISO 10816-3 y temperaturas para ubicar el activo sobre la curva de degradación P-F.\n"
-            "3. **Emisión de Órdenes de Trabajo**: Puede solicitarme directamente: *'Crea una orden de trabajo para K-201A por vibración alta'* o *'Crear plan de mantenimiento predictivo'*.\n\n"
-            "Puede formular preguntas como:\n"
-            "- *'¿Cómo está el estado del K-201A?'*\n"
-            "- *'Crea una orden de trabajo urgente para el BCP-204'*\n"
-            "- *'¿Cuáles son los umbrales de vibración ISO 10816?'*\n"
-            "- *'¿Cómo calcular el RPN en un análisis AMEF?'*"
+            "El sistema de confiabilidad industrial recomienda estructurar el análisis bajo los principios de **SAE JA1011**, **ISO 14224** y el motor predictivo **XGBoost**:\n"
+            "1. **Listado de Equipos Críticos**: Pregunte *'Listar todos los equipos críticos'* o *'¿Qué máquinas tienen mayor probabilidad de dañarse?'* para ver la clasificación Clase A (RPN) y las alertas de Machine Learning.\n"
+            "2. **Identificación del Activo**: Seleccione o mencione el TAG del equipo (ejemplo: `K-201A`, `P-501A`, `CMP-001`, `BCP-204`, `TK-101`) para consultar su dossier completo.\n"
+            "3. **Emisión de Órdenes de Trabajo**: Puede solicitarme directamente: *'Crea una orden de trabajo para K-201A por vibración alta'* o *'Crear plan de mantenimiento predictivo'*."
         )
 
     def _extract_suggestions(self, text: str, eq_context: Optional[Dict[str, Any]]) -> List[str]:
@@ -928,31 +1345,42 @@ class RcmChatbotService:
         suggestions = []
         if eq_context:
             tag = eq_context['tag_number']
+            suggestions.append(f"¿Cuál es la probabilidad de falla de {tag}?")
             suggestions.append(f"Crear orden de trabajo para {tag}")
             suggestions.append(f"Ver matriz AMEF de {tag}")
-            suggestions.append(f"Generar plan preventivo para {tag}")
-            suggestions.append(f"Consultar telemetría de {tag}")
+            suggestions.append(f"Listar todos los equipos críticos")
         else:
-            suggestions.append("¿Cuáles son las 7 preguntas de SAE JA1011?")
-            suggestions.append("¿Cómo evaluar la vibración bajo ISO 10816?")
+            suggestions.append("Listar todos los equipos críticos")
+            suggestions.append("¿Qué máquinas tienen probabilidad de dañarse?")
             suggestions.append("Evaluar el estado del compresor K-201A")
-            suggestions.append("¿Cómo se calcula el RPN en AMEF?")
+            suggestions.append("¿Cuáles son las 7 preguntas de SAE JA1011?")
 
         return suggestions[:4]
 
     def _build_rcm_data(self, text: str, eq_context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """Construye un bloque estructurado RCM para renderizado en componentes de UI."""
+        """Construye un bloque estructurado RCM + ML para renderizado en componentes de UI."""
         if eq_context:
             tag = eq_context['tag_number']
             m = eq_context.get('latest_metric') or {}
+            ml_pred = eq_context.get('ml_prediction') or {}
             vib = m.get('vibration_mm_s')
-            severity = "critical" if vib and vib > 7.1 else ("high" if vib and vib > 4.5 else "low")
+            prob_ml = ml_pred.get('probabilidad_falla', 0.0)
+
+            severity = "low"
+            if (vib and vib > 7.1) or prob_ml >= 0.70:
+                severity = "critical"
+            elif (vib and vib > 4.5) or prob_ml >= 0.40:
+                severity = "high"
+
             return {
                 "equipmentTag": tag,
                 "equipmentName": eq_context['name'],
                 "criticalityLevel": eq_context['criticality'],
+                "rpnScore": eq_context.get('rpn_score'),
                 "vibration_rms": vib,
                 "temperature_c": m.get('temperature_celsius'),
+                "failure_probability_pct": ml_pred.get('probabilidad_falla_pct', 0.0),
+                "ml_alert_level": ml_pred.get('clasificacion_alerta', 'NORMAL'),
                 "severity": severity,
                 "recommendedTask": "Inspección predictiva y verificación de alineación láser." if severity != "low" else "Monitoreo rutinario por condición."
             }
@@ -969,6 +1397,7 @@ class RcmChatbotService:
 
     def generate_session_id(self) -> str:
         return f"session_{int(datetime.now(timezone.utc).timestamp())}_{uuid.uuid4().hex[:8]}"
+
 
 # Instancia Singleton del servicio para toda la aplicación
 rcm_chatbot_service = RcmChatbotService()
