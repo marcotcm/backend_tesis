@@ -1,7 +1,7 @@
 """
 Servicio Predictivo con Inteligencia Artificial (Heimdall RCM)
 Arquitectura Híbrida de Dos Capas:
-1. Capa ML (XGBoost/LightGBM): Análisis estadístico ultrarrápido de series de tiempo.
+1. Capa ML (XGBoost/LightGBM): Análisis estadístico ultrarrápido de series de tiempo, fallas y mantenimiento.
 2. Capa Cognitiva (Gemini): Traducción técnica, diagnóstico de causa raíz y planes prescriptivos.
 """
 
@@ -45,7 +45,7 @@ client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 try:
     MODELO_ML = joblib.load("modelo_bomba_inyeccion.pkl")
     COLUMNAS_ESPERADAS = joblib.load("columnas_modelo.pkl")
-    print("[INFO] Modelo predictivo de ML cargado correctamente.")
+    print("[INFO] Modelo predictivo de ML Multi-Equipo cargado correctamente.")
 except FileNotFoundError:
     MODELO_ML = None
     COLUMNAS_ESPERADAS = []
@@ -53,37 +53,148 @@ except FileNotFoundError:
 
 
 # =====================================================================
+# FUNCIÓN AUXILIAR: IDENTIFICACIÓN DEL TIPO DE MÁQUINA
+# =====================================================================
+def identificar_categoria_equipo(equipment: Equipment) -> dict:
+    """
+    Clasifica el activo en Bomba, Compresor o Tanque revisando su tag_number,
+    name, equipment_type y technical_specifications.
+    """
+    tag = (equipment.tag_number or "").upper()
+    nombre = (equipment.name or "").upper()
+    tipo = (equipment.equipment_type or "").upper()
+    specs_str = str(equipment.technical_specifications or {}).upper()
+
+    es_tanque = 0
+    es_compresor = 0
+    es_bomba = 0
+
+    if "TK" in tag or "TANQUE" in nombre or "BALA" in nombre or "ESTATICO" in tipo or "ESTÁTICO" in tipo:
+        es_tanque = 1
+    elif "CMP" in tag or tag.startswith("K-") or "COMPRESOR" in nombre or "COMPRESSOR" in specs_str:
+        es_compresor = 1
+    else:
+        es_bomba = 1
+
+    return {
+        "is_bomba": es_bomba,
+        "is_compresor": es_compresor,
+        "is_tanque": es_tanque
+    }
+
+
+def _safe_float(val, default: float = 0.0) -> float:
+    try:
+        if val is None:
+            return default
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+# =====================================================================
 # FUNCIÓN AUXILIAR: EVALUACIÓN RÁPIDA CON MACHINE LEARNING (CAPA 1)
 # =====================================================================
-def evaluar_metrica_actual_ml(metricas_orm: list) -> dict:
+def evaluar_metrica_actual_ml(
+    equipment: Equipment,
+    metricas_orm: list,
+    ultimas_fallas: list | None = None,
+    ultimos_mantenimientos: list | None = None
+) -> dict:
     """
-    Toma el historial de lecturas recientes (objetos ORM), las aplanan en un DataFrame
-    de Pandas, calcula las derivadas temporales (medias móviles, deltas) y ejecuta
-    la predicción sobre la métrica más reciente para ver si saltó a zona de riesgo.
+    Toma el activo, su historial de lecturas recientes, su historial de fallas y
+    mantenimientos, aplana todas las variables en un DataFrame de Pandas, calcula
+    las derivadas temporales (medias móviles, deltas) y ejecuta la predicción sobre
+    la métrica más reciente para Bombas, Compresores y Tanques.
     """
     if not MODELO_ML or not metricas_orm:
-        return {"probabilidad_falla": 0.0, "clasificacion_alerta": "SIN DATOS ML", "salto_amperaje": 0.0}
+        return {
+            "probabilidad_falla": 0.0,
+            "clasificacion_alerta": "SIN DATOS ML",
+            "salto_amperaje": 0.0,
+            "dias_ultima_falla": 0.0,
+            "dias_ultimo_mantenimiento": 0.0
+        }
+
+    ultimas_fallas = ultimas_fallas or []
+    ultimos_mantenimientos = ultimos_mantenimientos or []
+
+    cat_flags = identificar_categoria_equipo(equipment)
+    tech_specs = equipment.technical_specifications or {}
+
+    # Cálculo de variables históricas de Fallas y Mantenimiento
+    ahora = datetime.now(timezone.utc)
+    prev_failures_count = len(ultimas_fallas)
+    historical_downtime_hours = sum(_safe_float(getattr(f, "downtime_hours", 0.0)) for f in ultimas_fallas)
+
+    if ultimas_fallas and getattr(ultimas_fallas[0], "failure_date", None):
+        f_date = ultimas_fallas[0].failure_date
+        if f_date.tzinfo is None:
+            f_date = f_date.replace(tzinfo=timezone.utc)
+        days_since_last_failure = max((ahora - f_date).total_seconds() / 86400.0, 0.0)
+    else:
+        days_since_last_failure = 180.0  # Valor base si no registra fallas recientes
+
+    if ultimos_mantenimientos and getattr(ultimos_mantenimientos[0], "execution_date", None):
+        m_date = ultimos_mantenimientos[0].execution_date
+        if m_date.tzinfo is None:
+            m_date = m_date.replace(tzinfo=timezone.utc)
+        days_since_last_maint = max((ahora - m_date).total_seconds() / 86400.0, 0.0)
+    else:
+        days_since_last_maint = 60.0  # Valor base si no registra mantenimientos recientes
 
     data = []
     for m in metricas_orm:
-        # Extraemos las métricas estáticas y las variables flexibles dentro del JSON 'specific_metrics'
         specs = m.specific_metrics or {}
+
+        # Extracción compatible con Bombas, Compresores y Tanques
+        presion_descarga = _safe_float(
+            specs.get("presion_descarga_psi", specs.get("presion_psi", specs.get("Presión de descarga (psig)", tech_specs.get("presion_descarga_psi", 0.0))))
+        )
+        presion_succion = _safe_float(
+            specs.get("presion_succion_psi", tech_specs.get("presion_succion_psi", 0.0))
+        )
+        caudal_gas = _safe_float(
+            specs.get("caudal_mmscfd", tech_specs.get("caudal_mmscfd", 0.0))
+        )
+        velocidad_rpm = _safe_float(
+            specs.get("velocidad_rpm", specs.get("rpm", specs.get("Velocidad (RPM)", tech_specs.get("velocidad_rpm", tech_specs.get("rpm", 0.0)))))
+        )
+
         data.append({
             "recorded_at": m.recorded_at,
-            "temperature_celsius": float(m.temperature_celsius) if m.temperature_celsius else 0.0,
-            "vibration_mm_s": float(m.vibration_mm_s) if m.vibration_mm_s else 0.0,
-            "flpPsi": float(specs.get("flpPsi", 0.0)),
-            "thpPsi": float(specs.get("thpPsi", 0.0)),
-            "motorAmps": float(specs.get("motorAmps", 0.0)),
-            "flowRateBpd": float(specs.get("flowRateBpd", 0.0)),
-            "waterCutPercent": float(specs.get("waterCutPercent", 0.0))
+            "is_bomba": cat_flags["is_bomba"],
+            "is_compresor": cat_flags["is_compresor"],
+            "is_tanque": cat_flags["is_tanque"],
+            "temperature_celsius": _safe_float(m.temperature_celsius),
+            "vibration_mm_s": _safe_float(m.vibration_mm_s),
+            "operating_hours": _safe_float(m.operating_hours, _safe_float(equipment.usage_time)),
+            "flpPsi": _safe_float(specs.get("flpPsi", tech_specs.get("flpPsi", 0.0))),
+            "thpPsi": _safe_float(specs.get("thpPsi", tech_specs.get("thpPsi", 0.0))),
+            "motorAmps": _safe_float(specs.get("motorAmps", tech_specs.get("motorAmps", 0.0))),
+            "flowRateBpd": _safe_float(specs.get("flowRateBpd", tech_specs.get("flowRateBpd", 0.0))),
+            "waterCutPercent": _safe_float(specs.get("waterCutPercent", tech_specs.get("waterCutPercent", 0.0))),
+            "presion_succion_psi": presion_succion,
+            "presion_descarga_psi": presion_descarga,
+            "caudal_mmscfd": caudal_gas,
+            "velocidad_rpm": velocidad_rpm,
+            "internal_pressure_psi": _safe_float(specs.get("internal_pressure_psi", 0.0)),
+            "vapor_pressure_psi": _safe_float(specs.get("vapor_pressure_psi", 0.0)),
+            "liquid_level_percentage": _safe_float(specs.get("liquid_level_percentage", 0.0)),
+            "prev_failures_count": prev_failures_count,
+            "days_since_last_failure": round(days_since_last_failure, 2),
+            "days_since_last_maint": round(days_since_last_maint, 2),
+            "historical_downtime_hours": round(historical_downtime_hours, 2)
         })
-    
+
     # Ordenar cronológicamente (ascendente) para que los cálculos de media móvil tengan sentido físico
     df = pd.DataFrame(data).sort_values("recorded_at").reset_index(drop=True)
-    
-    # Calcular las características rodantes (Rolling Features) para entender la tendencia temporal
-    ventanas = ["temperature_celsius", "vibration_mm_s", "motorAmps", "flowRateBpd"]
+
+    # Calcular las características rodantes (Rolling Features) para los 3 tipos de equipos
+    ventanas = [
+        "temperature_celsius", "vibration_mm_s", "motorAmps",
+        "flowRateBpd", "presion_descarga_psi", "internal_pressure_psi"
+    ]
     for col in ventanas:
         if col in df.columns:
             df[f"{col}_media_12h"] = df[col].rolling(window=12, min_periods=1).mean()
@@ -97,14 +208,16 @@ def evaluar_metrica_actual_ml(metricas_orm: list) -> dict:
 
     # Extraer únicamente el último registro (el estado actual de la máquina)
     ultima_lectura = df[COLUMNAS_ESPERADAS].iloc[[-1]]
-    
-    # Inferencia (probabilidad de que la clase sea 1 = Falla Inminente)
+
+    # Inferencia (probabilidad de que la clase sea 1 = Falla Inminente en < 48h)
     prob_falla = float(MODELO_ML.predict_proba(ultima_lectura)[0, 1])
-    
+
     return {
         "probabilidad_falla": round(prob_falla, 4),
         "clasificacion_alerta": "CRÍTICA" if prob_falla >= 0.70 else ("MODERADA" if prob_falla >= 0.40 else "NORMAL"),
-        "salto_amperaje": round(float(df['motorAmps_delta'].iloc[-1]), 2) if 'motorAmps_delta' in df.columns else 0.0
+        "salto_amperaje": round(float(df["motorAmps_delta"].iloc[-1]), 2) if "motorAmps_delta" in df.columns else 0.0,
+        "dias_ultima_falla": round(days_since_last_failure, 1),
+        "dias_ultimo_mantenimiento": round(days_since_last_maint, 1)
     }
 
 
@@ -169,7 +282,7 @@ async def ejecutar_analisis_predictivo_ia(
     trigger_reference_id: uuid.UUID | None = None
 ) -> dict:
     """
-    Evalúa profundamente a un equipo específico. 
+    Evalúa profundamente a un equipo específico (Bomba, Compresor o Tanque).
     Llamado manual por el usuario o automáticamente si una métrica sale de rango.
     """
     equipment = (await db.execute(select(Equipment).where(Equipment.id == equipment_id))).scalar_one_or_none()
@@ -195,7 +308,6 @@ async def ejecutar_analisis_predictivo_ia(
     )).scalars().all()
 
     # 2. Búsqueda de Feedback Loop (Correcciones Humanas)
-    # Busca las últimas 3 veces que la IA predijo algo para este equipo y un humano lo corrigió.
     correcciones_query = (await db.execute(
         select(AICorrection, AIRecommendation)
         .join(AIRecommendation, AICorrection.recommendation_id == AIRecommendation.id)
@@ -210,16 +322,22 @@ async def ejecutar_analisis_predictivo_ia(
         for corr, rec in correcciones_query:
             str_correcciones += f"- La IA alertó: '{rec.prediction_type}'. El humano corrigió y estableció: '{corr.corrected_text}'\n"
 
-    # 3. PRE-FILTRO: EJECUCIÓN DEL MACHINE LEARNING SOBRE EL ESTADO ACTUAL
-    resultado_ml = evaluar_metrica_actual_ml(metricas_recientes)
+    # 3. PRE-FILTRO: EJECUCIÓN DEL MACHINE LEARNING SOBRE EL ESTADO ACTUAL + HISTORIAL DE FALLAS Y MANTENIMIENTO
+    resultado_ml = evaluar_metrica_actual_ml(
+        equipment=equipment,
+        metricas_orm=metricas_recientes,
+        ultimas_fallas=ultimas_fallas,
+        ultimos_mantenimientos=ultimos_mantenimientos
+    )
     
     str_machine_learning = "SIN DATOS SUFICIENTES PARA EVALUACIÓN ML."
     if metricas_recientes and MODELO_ML:
         str_machine_learning = (
-            f"RESULTADOS DEL MODELO ESTADÍSTICO DE MACHINE LEARNING:\n"
-            f"Probabilidad de Falla Inminente: {resultado_ml['probabilidad_falla'] * 100}%\n"
+            f"RESULTADOS DEL MODELO ESTADÍSTICO DE MACHINE LEARNING (MULTI-EQUIPO):\n"
+            f"Probabilidad de Falla Inminente (<48h): {resultado_ml['probabilidad_falla'] * 100}%\n"
             f"Clasificación de Alerta: {resultado_ml['clasificacion_alerta']}\n"
             f"Salto abrupto de amperaje (Delta): {resultado_ml['salto_amperaje']} A respecto al historial reciente.\n"
+            f"Días desde última falla: {resultado_ml['dias_ultima_falla']} días | Días desde último mantenimiento: {resultado_ml['dias_ultimo_mantenimiento']} días.\n"
         )
 
     # 4. Formateo de las métricas crudas para dárselas de contexto a Gemini
@@ -262,8 +380,8 @@ async def ejecutar_analisis_predictivo_ia(
         f"Estado Operativo: {equipment.operational_status.upper()} | Horas de Uso Acumuladas: {equipment.usage_time} hrs\n"
         f"Umbrales Normales Operativos: {umbrales}\n\n"
         f"ANÁLISIS DE CRITICIDAD:\n{str_criticidad}\n\n"
-        f"{str_machine_learning}\n\n" # <--- Diagnóstico matemático
-        f"{str_correcciones}\n\n"       # <--- Factor humano
+        f"{str_machine_learning}\n\n"
+        f"{str_correcciones}\n\n"
         f"ANÁLISIS DE TELEMETRÍA (ACTUAL VS HISTÓRICO):\n{str_metricas}\n\n"
         f"HISTORIAL DE FALLAS REALES:\n{str_fallas}\n\n"
         f"HISTORIAL DE MANTENIMIENTOS EJECUTADOS:\n{str_mantenimientos}"
@@ -271,32 +389,30 @@ async def ejecutar_analisis_predictivo_ia(
 
     # 6. REGLAS DE NEGOCIO PARA EL MODELO GENERATIVO
     instrucciones_rcm = (
-        "Eres un Ingeniero Jefe de Confiabilidad CMRP experto en Análisis de Tendencias CBM.\n\n"
+        "Eres un Ingeniero Jefe de Confiabilidad CMRP experto en Análisis de Tendencias CBM para Bombas, Compresores y Tanques.\n\n"
         "REGLAS ESTRICTAS ANTI-ALUCINACIONES:\n"
-        "1. EXPLICACIÓN ML: Recibes un diagnóstico probabilístico (%). Tu trabajo es EXPLICAR físicamente por qué el algoritmo asignó ese porcentaje basándote en el salto temporal de la telemetría.\n"
+        "1. EXPLICACIÓN ML: Recibes un diagnóstico probabilístico (%). Tu trabajo es EXPLICAR físicamente por qué el algoritmo asignó ese porcentaje basándote en el salto temporal de la telemetría, fallas previas y mantenimientos.\n"
         "2. CERO INVENTOS: Si el ML arroja baja probabilidad (<40%) y los valores están dentro de umbrales, decreta 'Operación Normal'. NO inventes fallas.\n"
         "3. HISTORIAL DE CORRECCIONES: Lee atentamente las correcciones de los expertos. Si la telemetría muestra un pico similar a una alerta pasada que el experto desestimó, IGNORA la anomalía estadística y decreta operación normal.\n"
         "4. CRITICIDAD E IMPACTO: Si detectas anomalía real, revisa los puntajes de Seguridad o Ambiental para incluir contenciones preventivas urgentes en tu plan de acción.\n"
-        "5. CORRELACIÓN HISTÓRICA: Usa el 'Historial de Fallas' para justificar tus hipótesis (Ej: 'Este aumento precede a la rotura vista en X fecha')."
+        "5. CORRELACIÓN HISTÓRICA: Usa el 'Historial de Fallas' y 'Historial de Mantenimientos' para justificar tus hipótesis (Ej: 'Este aumento precede a la rotura vista en X fecha')."
     )
 
     configuracion = types.GenerateContentConfig(
         system_instruction=instrucciones_rcm,
-        temperature=0.1,  # Baja temperatura para asegurar respuestas técnicas deterministas
+        temperature=0.1,
         response_mime_type="application/json",
         response_schema=InformeConfiabilidadRCM,
     )
 
     try:
-        # Llamada asíncrona a la API de Google GenAI
         respuesta = await client.aio.models.generate_content(
-            model="gemini-3.1-flash-lite", # Mejor razonamiento para cruzar ML, telemetría y texto humano
+            model="gemini-2.5-flash",
             contents=contexto_tecnico,
             config=configuracion
         )
         resultado_obj = InformeConfiabilidadRCM.model_validate_json(respuesta.text)
         
-        # Inyectamos manualmente la probabilidad del ML para que el Frontend la pinte en gráficas
         resultado_dict = resultado_obj.model_dump()
         resultado_dict["probabilidad_ml"] = resultado_ml['probabilidad_falla']
         
@@ -311,7 +427,6 @@ async def ejecutar_analisis_predictivo_ia(
         normas_str = " , ".join(resultado_obj.normas_aplicadas)
         plan_accion_str = "\n".join([f"{i}. {accion}" for i, accion in enumerate(resultado_obj.plan_accion, start=1)])
 
-        # Ensamblado del dictamen técnico
         informe_texto = (
             f"DIAGNÓSTICO Y PRESCRIPCIÓN\n"
             f"INFORME DE CONFIABILIDAD Y DIAGNÓSTICO TÉCNICO (CMRP / ISO 55000)\n"
@@ -335,12 +450,11 @@ async def ejecutar_analisis_predictivo_ia(
             "recommendation_text": informe_texto,
             "confidence_score": float(resultado_obj.confianza),
             "prediction_type": resultado_obj.prediction_type,
-            "status": "Pendiente" # Queda a la espera de que el Auditor Técnico lo acepte o corrija
+            "status": "Pendiente"
         }
         
         recomendacion_creada = await crud_recommendation.create(db, payload_db)
         
-        # --- NUEVO: Disparar Notificación de IA ---
         if recomendacion_creada:
             await notify_ai_analysis_ready(
                 db=db,
@@ -396,7 +510,7 @@ async def generar_plan_mantenimiento_ia(
 
     configuracion = types.GenerateContentConfig(
         system_instruction=instrucciones_planificador,
-        temperature=0.0, # Temperatura 0 para evitar alucinaciones en listas de repuestos 
+        temperature=0.0,
         response_mime_type="application/json",
         response_schema=PlanMantenimientoIA,
     )
@@ -418,7 +532,6 @@ async def generar_plan_mantenimiento_ia(
         print(f"[ERROR IA] Fallo generando plan estructurado: {e}")
         return {"plan_generado": None, "error": str(e), "recomendacion_generada": False}
 
-    # Transformar el JSON estructurado en un reporte legible para los técnicos de campo
     texto_plan = (
         f"PROPUESTA DE PLAN DE MANTENIMIENTO: {plan_obj.title.upper()}\n"
         f"TIPO DE PLAN: {plan_obj.maintenance_type.upper()} | PRIORIDAD: {plan_obj.priority.upper()}\n"
@@ -441,7 +554,6 @@ async def generar_plan_mantenimiento_ia(
             f"SEGURIDAD Y H.S.E (CRÍTICO): {seguridad_str.upper()}\n\n"
         )
 
-    # Persistencia en la bandeja de entrada del planificador (AIRecommendation)
     payload_db = {
         "equipment_id": equipment_id,
         "trigger_source": trigger_source,
@@ -454,7 +566,6 @@ async def generar_plan_mantenimiento_ia(
     
     recomendacion_creada = await crud_recommendation.create(db, payload_db)
     
-    # --- NUEVO: Disparar Notificación de Plan IA ---
     if recomendacion_creada:
         await notify_ai_analysis_ready(
             db=db,
@@ -463,7 +574,6 @@ async def generar_plan_mantenimiento_ia(
             user_id=None
         )
 
-    # Output para inyectar directo al Frontend y visualización interactiva
     plan_final = {
         "equipment_id": str(equipment_id),
         "status": "draft",
@@ -485,9 +595,8 @@ async def generar_plan_mantenimiento_ia(
 async def evaluar_riesgo_global_planta(db: AsyncSession) -> dict:
     """
     Función de altísimo rendimiento.
-    Recorre TODOS los activos de la planta, extrae sus datos y los pasa por XGBoost.
-    No llama a Gemini, por lo que analiza cientos de equipos en pocos milisegundos 
-    sin gastar cuota de API, funcionando como un "Radar Predictivo".
+    Recorre TODOS los activos de la planta (Bombas, Compresores y Tanques),
+    extrae sus métricas, historial de fallas y mantenimientos y los pasa por XGBoost.
     """
     equipos_activos = (await db.execute(
         select(Equipment).where(Equipment.is_active == True, Equipment.deleted_at.is_(None))
@@ -497,7 +606,6 @@ async def evaluar_riesgo_global_planta(db: AsyncSession) -> dict:
     equipos_sanos = 0
 
     for equipo in equipos_activos:
-        # Extraemos el historial de cada equipo para la ventana móvil
         metricas_recientes = (await db.execute(
             select(EquipmentMetricHistory)
             .where(EquipmentMetricHistory.equipment_id == equipo.id)
@@ -506,12 +614,30 @@ async def evaluar_riesgo_global_planta(db: AsyncSession) -> dict:
         )).scalars().all()
 
         if not metricas_recientes:
-            continue # Si un equipo es nuevo y no tiene datos, lo saltamos
+            continue
 
-        # Evaluamos el vector de datos usando el modelo matemático local
-        resultado_ml = evaluar_metrica_actual_ml(metricas_recientes)
+        ultimas_fallas = (await db.execute(
+            select(FailureHistory)
+            .where(FailureHistory.equipment_id == equipo.id)
+            .order_by(FailureHistory.failure_date.desc())
+            .limit(5)
+        )).scalars().all()
+
+        ultimos_mantenimientos = (await db.execute(
+            select(MaintenanceHistory)
+            .where(MaintenanceHistory.equipment_id == equipo.id)
+            .order_by(MaintenanceHistory.execution_date.desc())
+            .limit(5)
+        )).scalars().all()
+
+        # Evaluamos el vector de datos completo usando el modelo matemático local
+        resultado_ml = evaluar_metrica_actual_ml(
+            equipment=equipo,
+            metricas_orm=metricas_recientes,
+            ultimas_fallas=ultimas_fallas,
+            ultimos_mantenimientos=ultimos_mantenimientos
+        )
         
-        # Filtro Táctico: Solo prestamos atención a los que pasan del 40% de riesgo (Alerta Moderada o Crítica)
         if resultado_ml["probabilidad_falla"] >= 0.40:
             equipos_en_riesgo.append({
                 "equipment_id": str(equipo.id),
@@ -524,7 +650,6 @@ async def evaluar_riesgo_global_planta(db: AsyncSession) -> dict:
         else:
             equipos_sanos += 1
 
-    # Ordenamos el radar priorizando los equipos con la mayor probabilidad de rotura
     equipos_en_riesgo = sorted(equipos_en_riesgo, key=lambda x: x["probabilidad_falla"], reverse=True)
 
     return {
@@ -551,17 +676,13 @@ async def generar_planes_mantenimiento_globales(db: AsyncSession, trigger_source
     planes_generados = []
     errores = []
 
-    # Iteramos únicamente sobre los equipos que el modelo estadístico marcó en peligro
     for equipo_alerta in equipos_criticos:
-        
-        # Le indicamos a Gemini el porqué lo estamos llamando
         contexto_diagnostico = (
             f"El modelo predictivo de Machine Learning ha detectado una probabilidad de falla estadística del "
             f"{equipo_alerta['probabilidad_falla'] * 100}%. Nivel de alerta: {equipo_alerta['alerta']}. "
             f"Se requiere formular un plan de inspección, cambio de consumibles y contención inmediata basado en esta condición de alarma."
         )
         
-        # Ejecución del Agente Generativo
         resultado_plan = await generar_plan_mantenimiento_ia(
             db=db,
             equipment_id=uuid.UUID(equipo_alerta["equipment_id"]),
