@@ -4,7 +4,7 @@ Arquitectura Híbrida de Dos Capas:
 1. Capa ML (XGBoost/LightGBM): Análisis estadístico ultrarrápido de series de tiempo, fallas y mantenimiento.
 2. Capa Cognitiva (Gemini + Contingencia con Datos Reales): Traducción técnica, diagnóstico de causa raíz y planes prescriptivos.
 Regla de Persistencia:
-- El Análisis Predictivo SOLO se guarda en `ai_recommendations` si existe probabilidad de falla / requiere intervención.
+- El Análisis Predictivo SOLO se guarda en `ai_recommendations` si existe probabilidad de falla (>=40%), anomalía en `standard_metric` o disparo por métrica anómala.
 - El Plan de Mantenimiento SIEMPRE se guarda en `ai_recommendations`.
 """
 
@@ -131,11 +131,45 @@ def _safe_float(val, default: float = 0.0) -> float:
 
 def _tiene_anomalia_fisica_directa(equipment: Equipment, metrica_actual: Optional[EquipmentMetricHistory]) -> bool:
     """
-    Verifica si la última lectura supera umbrales físicos de seguridad (ISO 10816-3 / proceso),
-    como respaldo adicional al porcentaje de XGBoost.
+    Verifica si la última lectura supera los umbrales de `standard_metric` definidos en el equipo
+    (exactamente igual que services/equipment_metrics.py) o los umbrales físicos ISO 10816-3.
     """
     if not metrica_actual:
         return False
+
+    # 1. Revisar contra el diccionario 'standard_metric' del propio equipo en BD
+    if equipment and isinstance(equipment.technical_specifications, dict):
+        standard_metric = equipment.technical_specifications.get("standard_metric", {})
+        if isinstance(standard_metric, dict):
+            if "temperature_celsius" in standard_metric and metrica_actual.temperature_celsius is not None:
+                t_Limits = standard_metric["temperature_celsius"]
+                if isinstance(t_Limits, dict):
+                    t_min = t_Limits.get("min", -50)
+                    t_max = t_Limits.get("max", 1000)
+                    if metrica_actual.temperature_celsius < t_min or metrica_actual.temperature_celsius > t_max:
+                        return True
+
+            if "vibration_mm_s" in standard_metric and metrica_actual.vibration_mm_s is not None:
+                v_Limits = standard_metric["vibration_mm_s"]
+                if isinstance(v_Limits, dict):
+                    v_min = v_Limits.get("min", 0)
+                    v_max = v_Limits.get("max", 100)
+                    if metrica_actual.vibration_mm_s < v_min or metrica_actual.vibration_mm_s > v_max:
+                        return True
+
+            if isinstance(metrica_actual.specific_metrics, dict):
+                for var_name, valor_actual in metrica_actual.specific_metrics.items():
+                    if var_name in standard_metric and isinstance(standard_metric[var_name], dict):
+                        val_num = _safe_float(valor_actual, None)
+                        if val_num is not None:
+                            s_min = standard_metric[var_name].get("min")
+                            s_max = standard_metric[var_name].get("max")
+                            if s_min is not None and val_num < _safe_float(s_min):
+                                return True
+                            if s_max is not None and val_num > _safe_float(s_max):
+                                return True
+
+    # 2. Respaldo por umbrales físicos estándar ISO 10816-3 / proceso
     cat = identificar_categoria_equipo(equipment)
     vib = _safe_float(metrica_actual.vibration_mm_s)
     temp = _safe_float(metrica_actual.temperature_celsius)
@@ -181,7 +215,6 @@ def evaluar_metrica_actual_ml(
     cat_flags = identificar_categoria_equipo(equipment)
     tech_specs = equipment.technical_specifications or {}
 
-    # Cálculo de variables históricas de Fallas y Mantenimiento
     ahora = datetime.now(timezone.utc)
     prev_failures_count = len(ultimas_fallas)
     historical_downtime_hours = sum(_safe_float(getattr(f, "downtime_hours", 0.0)) for f in ultimas_fallas)
@@ -245,10 +278,8 @@ def evaluar_metrica_actual_ml(
             "historical_downtime_hours": round(historical_downtime_hours, 2)
         })
 
-    # Ordenar cronológicamente (ascendente) para que los cálculos de media móvil tengan sentido físico
     df = pd.DataFrame(data).sort_values("recorded_at").reset_index(drop=True)
 
-    # Calcular las características rodantes (Rolling Features) para los 3 tipos de equipos
     ventanas = [
         "temperature_celsius", "vibration_mm_s", "motorAmps",
         "flowRateBpd", "presion_descarga_psi", "internal_pressure_psi"
@@ -259,15 +290,11 @@ def evaluar_metrica_actual_ml(
             df[f"{col}_std_12h"] = df[col].rolling(window=12, min_periods=1).std().fillna(0)
             df[f"{col}_delta"] = df[col].diff().fillna(0)
 
-    # Alinear las columnas exactamente como las espera el modelo XGBoost
     for col in COLUMNAS_ESPERADAS:
         if col not in df.columns:
             df[col] = 0.0
 
-    # Extraer únicamente el último registro (el estado actual de la máquina)
     ultima_lectura = df[COLUMNAS_ESPERADAS].iloc[[-1]]
-
-    # Inferencia (probabilidad de que la clase sea 1 = Falla Inminente en < 48h)
     prob_falla = float(MODELO_ML.predict_proba(ultima_lectura)[0, 1])
 
     return {
@@ -339,12 +366,12 @@ def _generar_informe_contingencia_mismos_datos(
     metricas_recientes: list,
     ultimas_fallas: list,
     ultimos_mantenimientos: list,
-    resultado_ml: dict
+    resultado_ml: dict,
+    forzar_intervencion: bool = False
 ) -> InformeConfiabilidadRCM:
     """
     Si Gemini falla, genera la estructura InformeConfiabilidadRCM tomando exactamente
     los mismos datos del equipo y del modelo XGBoost.
-    Evalúa `requiere_intervencion` estrictamente según si hay probabilidad de falla (>=40%) o anomalía física.
     """
     cat = identificar_categoria_equipo(equipment)
     prob = resultado_ml.get("probabilidad_falla", 0.0)
@@ -366,8 +393,7 @@ def _generar_informe_contingencia_mismos_datos(
     status_failed = (equipment.operational_status or "").strip().lower() in ["failed", "falla", "critical", "out_of_service"]
     anomalia_fisica = _tiene_anomalia_fisica_directa(equipment, m_actual)
 
-    # SOLO requiere intervención (y por ende SOLO se guarda en BD) si tiene probabilidad de fallar (>=40%), anomalía física o estado failed
-    tiene_probabilidad_fallar = (prob >= 0.40) or anomalia_fisica or status_failed
+    tiene_probabilidad_fallar = forzar_intervencion or (prob >= 0.40) or anomalia_fisica or status_failed
 
     if not tiene_probabilidad_fallar:
         return InformeConfiabilidadRCM(
@@ -386,7 +412,7 @@ def _generar_informe_contingencia_mismos_datos(
 
     if prob >= 0.70 or vib > 7.1 or status_failed:
         pred_type = "Alerta Crítica de Falla Inminente"
-    elif prob >= 0.40 or vib >= 4.5:
+    elif prob >= 0.40 or vib >= 4.5 or anomalia_fisica:
         pred_type = "Inspección Basada en Condición (CBM)"
     else:
         pred_type = "Sustitución Preventiva Recomendada"
@@ -410,7 +436,7 @@ def _generar_informe_contingencia_mismos_datos(
             f"Correlación histórica: {txt_falla}; {txt_maint}."
         )
         hipotesis = (
-            f"El modelo XGBoost calcula {prob_pct}% de probabilidad de falla ({alerta_ml}) "
+            f"El análisis detecta desviación fuera de estándar y un {prob_pct}% de probabilidad en XGBoost ({alerta_ml}) "
             f"asociado a fatiga de empaquetaduras en bridas, diferencial de presión interna o desajuste en válvula de alivio (PSV)."
         )
         normas = ["ISO 14224", "API 653 / API 510", "SAE JA1011", "ISO 55000"]
@@ -429,8 +455,8 @@ def _generar_informe_contingencia_mismos_datos(
             f"Antecedentes: {txt_falla}; {txt_maint}."
         )
         hipotesis = (
-            f"La probabilidad de falla de {prob_pct}% ({alerta_ml}) y la variación de amperaje de {salto_amp} A "
-            f"evidencian fatiga mecánica en válvulas de succión/descarga, desgaste de anillos o desalineación de acople."
+            f"La desviación en telemetría (Riesgo ML: {prob_pct}%, delta de corriente: {salto_amp} A) "
+            f"evidencia fatiga mecánica en válvulas de succión/descarga, desgaste de anillos o desalineación de acople."
         )
         normas = ["ISO 10816-3", "ISO 14224", "API 618", "SAE JA1011"]
         plan_acc = [
@@ -448,8 +474,8 @@ def _generar_informe_contingencia_mismos_datos(
             f"Historial: {txt_falla}; {txt_maint}."
         )
         hipotesis = (
-            f"El algoritmo XGBoost determina un {prob_pct}% de probabilidad de falla (<48h) debido al incremento "
-            f"simultáneo de vibración ({vib} mm/s) y temperatura ({temp} °C), indicando desgaste en pistas de rodamientos o fatiga en sello mecánico."
+            f"Se registra condición fuera de umbral operativo (Riesgo ML <48h: {prob_pct}%) debido al comportamiento "
+            f"de vibración ({vib} mm/s) y temperatura ({temp} °C), indicando desgaste en pistas de rodamientos o fatiga en sello mecánico."
         )
         normas = ["ISO 10816-3", "ISO 14224", "API 610", "SAE JA1011"]
         plan_acc = [
@@ -564,53 +590,43 @@ def _generar_plan_contingencia_mismos_datos(
 
 async def _persistir_recomendacion_segura(db: Optional[AsyncSession], payload_db: dict, notif_title: str, notif_msg: str):
     """
-    Guarda la recomendación y dispara la notificación garantizando el commit en PostgreSQL.
-    Si la sesión `db` pasada desde un BackgroundTask ya se cerró, abre una nueva sesión con AsyncSessionLocal.
+    Guarda la recomendación y dispara la notificación usando una sesión limpia garantizada.
     """
-    try:
-        if db is not None and db.is_active:
-            rec = await crud_recommendation.create(db, payload_db)
-            await db.commit()
+    async with AsyncSessionLocal() as sesion_limpia:
+        try:
+            rec = await crud_recommendation.create(sesion_limpia, payload_db)
+            await sesion_limpia.commit()
             if rec:
-                await notify_ai_analysis_ready(db=db, title=notif_title, message=notif_msg, user_id=None)
-                await db.commit()
+                try:
+                    await sesion_limpia.refresh(rec)
+                except Exception:
+                    pass
+                await notify_ai_analysis_ready(db=sesion_limpia, title=notif_title, message=notif_msg, user_id=None)
+                await sesion_limpia.commit()
             return rec
-    except Exception as e:
-        print(f"[INFO DB] Sesión previa cerrada en BackgroundTask ({e}). Guardando con nueva sesión AsyncSessionLocal...")
-
-    async with AsyncSessionLocal() as nueva_db:
-        rec = await crud_recommendation.create(nueva_db, payload_db)
-        await nueva_db.commit()
-        if rec:
-            await notify_ai_analysis_ready(db=nueva_db, title=notif_title, message=notif_msg, user_id=None)
-            await nueva_db.commit()
-        return rec
+        except Exception as e:
+            print(f"[ERROR DB] Fallo guardando con AsyncSessionLocal ({e}). Intentando con sesión recibida...")
+            if db is not None:
+                rec = await crud_recommendation.create(db, payload_db)
+                await db.commit()
+                if rec:
+                    await notify_ai_analysis_ready(db=db, title=notif_title, message=notif_msg, user_id=None)
+                    await db.commit()
+                return rec
+            raise e
 
 
 # =====================================================================
 # ENDPOINT INTERNO 1: ANÁLISIS PREDICTIVO DETALLADO POR EQUIPO (CAPA 2)
 # =====================================================================
-async def ejecutar_analisis_predictivo_ia(
-    db: AsyncSession, 
-    equipment_id: uuid.UUID, 
-    trigger_source: str, 
+async def _ejecutar_analisis_predictivo_core(
+    db: AsyncSession,
+    equipment_id: uuid.UUID,
+    trigger_source: str,
     trigger_reference_id: uuid.UUID | None = None
 ) -> dict:
-    """
-    Evalúa profundamente a un equipo específico (Bomba, Compresor o Tanque).
-    SOLO guarda en `ai_recommendations` si el equipo tiene probabilidad de fallar (>=40% ML, anomalía física o requiere_intervencion=True).
-    """
-    try:
-        equipment = (await db.execute(select(Equipment).where(Equipment.id == equipment_id))).scalar_one_or_none()
-    except Exception:
-        async with AsyncSessionLocal() as bg_db:
-            return await ejecutar_analisis_predictivo_ia(
-                db=bg_db,
-                equipment_id=equipment_id,
-                trigger_source=trigger_source,
-                trigger_reference_id=trigger_reference_id
-            )
-
+    """Núcleo del análisis predictivo sobre una sesión activa y verificada."""
+    equipment = (await db.execute(select(Equipment).where(Equipment.id == equipment_id))).scalar_one_or_none()
     if not equipment:
         return {"analisis_ia": None, "error": "Equipo no encontrado", "recomendacion_generada": False}
 
@@ -654,7 +670,12 @@ async def ejecutar_analisis_predictivo_ia(
         ultimas_fallas=ultimas_fallas,
         ultimos_mantenimientos=ultimos_mantenimientos
     )
-    
+
+    metrica_mas_reciente = metricas_recientes[0] if metricas_recientes else None
+    es_disparo_anomalia = (trigger_reference_id is not None) or ("anomal" in (trigger_source or "").lower())
+    hay_anomalia_fisica = _tiene_anomalia_fisica_directa(equipment, metrica_mas_reciente)
+    hay_riesgo_ml = resultado_ml["probabilidad_falla"] >= 0.40
+
     str_machine_learning = "SIN DATOS SUFICIENTES PARA EVALUACIÓN ML."
     if metricas_recientes and MODELO_ML:
         str_machine_learning = (
@@ -699,6 +720,7 @@ async def ejecutar_analisis_predictivo_ia(
 
     # 5. CONSTRUCCIÓN DEL CONTEXTO MAESTRO PARA GEMINI
     contexto_tecnico = (
+        f"MOTIVO DE DISPARO: {trigger_source}\n"
         f"PERFIL DEL ACTIVO:\n"
         f"Tag: {equipment.tag_number} | Nombre: {equipment.name} | Tipo: {equipment.equipment_type}\n"
         f"Marca/Modelo: {equipment.brand or 'N/D'} - {equipment.model or 'N/D'}\n"
@@ -716,11 +738,11 @@ async def ejecutar_analisis_predictivo_ia(
     instrucciones_rcm = (
         "Eres un Ingeniero Jefe de Confiabilidad CMRP experto en Análisis de Tendencias CBM para Bombas, Compresores y Tanques.\n\n"
         "REGLAS ESTRICTAS ANTI-ALUCINACIONES:\n"
-        "1. EXPLICACIÓN ML: Recibes un diagnóstico probabilístico (%). Tu trabajo es EXPLICAR físicamente por qué el algoritmo asignó ese porcentaje basándote en el salto temporal de la telemetría, fallas previas y mantenimientos.\n"
-        "2. CERO INVENTOS: Si el ML arroja baja probabilidad (<40%) y los valores de la última lectura están dentro de umbrales normales, decreta 'Operación Normal' y `requiere_intervencion = false`. Si la probabilidad ML es >= 40% o la última lectura supera umbrales críticos, establece `requiere_intervencion = true`.\n"
-        "3. HISTORIAL DE CORRECCIONES: Lee atentamente las correcciones de los expertos. Si la telemetría muestra un pico similar a una alerta pasada que el experto desestimó, IGNORA la anomalía estadística y decreta operación normal.\n"
+        "1. EXPLICACIÓN ML Y TELEMETRÍA: Recibes un diagnóstico probabilístico (%) y la última lectura de sensores. Explica físicamente la condición basándote en el salto temporal de la telemetría, umbrales normales, fallas previas y mantenimientos.\n"
+        "2. CRITERIO DE INTERVENCIÓN: Si la probabilidad ML es >= 40% O si la última lectura registrada supera cualquiera de los 'Umbrales Normales Operativos', SIEMPRE establece `requiere_intervencion = true` y asigna el `prediction_type` de riesgo correspondiente. Solo establece `requiere_intervencion = false` cuando TANTO el ML (<40%) COMO todos los sensores estén dentro de rango normal.\n"
+        "3. HISTORIAL DE CORRECCIONES: Lee atentamente las correcciones de los expertos.\n"
         "4. CRITICIDAD E IMPACTO: Si detectas anomalía real, revisa los puntajes de Seguridad o Ambiental para incluir contenciones preventivas urgentes en tu plan de acción.\n"
-        "5. CORRELACIÓN HISTÓRICA: Usa el 'Historial de Fallas' y 'Historial de Mantenimientos' para justificar tus hipótesis (Ej: 'Este aumento precede a la rotura vista en X fecha')."
+        "5. CORRELACIÓN HISTÓRICA: Usa el 'Historial de Fallas' y 'Historial de Mantenimientos' para justificar tus hipótesis."
     )
 
     configuracion = types.GenerateContentConfig(
@@ -745,12 +767,12 @@ async def ejecutar_analisis_predictivo_ia(
             metricas_recientes=metricas_recientes,
             ultimas_fallas=ultimas_fallas,
             ultimos_mantenimientos=ultimos_mantenimientos,
-            resultado_ml=resultado_ml
+            resultado_ml=resultado_ml,
+            forzar_intervencion=(es_disparo_anomalia or hay_anomalia_fisica or hay_riesgo_ml)
         )
 
-    # Si el modelo ML detectó probabilidad de falla >= 40% o la lectura actual tiene anomalía física directa, asegurar que requiere_intervencion sea True
-    metrica_Mas_reciente = metricas_recientes[0] if metricas_recientes else None
-    if resultado_ml["probabilidad_falla"] >= 0.40 or _tiene_anomalia_fisica_directa(equipment, metrica_Mas_reciente):
+    # Si fue disparado por una métrica anómala real, o el ML es >= 40%, o supera standard_metric, asegurar que se guarde
+    if es_disparo_anomalia or hay_riesgo_ml or hay_anomalia_fisica:
         resultado_obj.requiere_intervencion = True
         if resultado_obj.prediction_type == "Operación Normal":
             resultado_obj.prediction_type = "Inspección Basada en Condición (CBM)"
@@ -758,7 +780,7 @@ async def ejecutar_analisis_predictivo_ia(
     resultado_dict = resultado_obj.model_dump()
     resultado_dict["probabilidad_ml"] = resultado_ml["probabilidad_falla"]
 
-    # 7. GENERACIÓN DEL REPORTE TEXTUAL Y GUARDADO SOLO SI TIENE PROBABILIDAD DE FALLAR (requiere_intervencion == True)
+    # 7. GENERACIÓN DEL REPORTE TEXTUAL Y GUARDADO SOLO SI TIENE PROBABILIDAD DE FALLAR / ANOMALÍA
     recomendacion_creada = None
 
     if resultado_obj.requiere_intervencion:
@@ -805,6 +827,52 @@ async def ejecutar_analisis_predictivo_ia(
     }
 
 
+async def ejecutar_analisis_predictivo_ia(
+    db: Optional[AsyncSession], 
+    equipment_id: uuid.UUID, 
+    trigger_source: str, 
+    trigger_reference_id: uuid.UUID | None = None
+) -> dict:
+    """
+    Punto de entrada principal para análisis predictivo.
+    Si es llamado desde un BackgroundTask (ej. cuando `trigger_reference_id` está presente o `db` es None),
+    abre siempre una sesión independiente con `AsyncSessionLocal()` para evitar sesiones huérfanas/cerradas.
+    """
+    if db is None or trigger_reference_id is not None:
+        async with AsyncSessionLocal() as bg_db:
+            return await _ejecutar_analisis_predictivo_core(
+                db=bg_db,
+                equipment_id=equipment_id,
+                trigger_source=trigger_source,
+                trigger_reference_id=trigger_reference_id
+            )
+
+    return await _ejecutar_analisis_predictivo_core(
+        db=db,
+        equipment_id=equipment_id,
+        trigger_source=trigger_source,
+        trigger_reference_id=trigger_reference_id
+    )
+
+
+async def ejecutar_analisis_predictivo_background(
+    equipment_id: uuid.UUID,
+    trigger_source: str,
+    trigger_reference_id: uuid.UUID | None = None
+) -> dict:
+    """
+    Función dedicada para `background_tasks.add_task(...)` en `services/equipment_metrics.py`.
+    No recibe la sesión del request HTTP sino que crea su propia `AsyncSessionLocal`.
+    """
+    async with AsyncSessionLocal() as bg_db:
+        return await _ejecutar_analisis_predictivo_core(
+            db=bg_db,
+            equipment_id=equipment_id,
+            trigger_source=trigger_source,
+            trigger_reference_id=trigger_reference_id
+        )
+
+
 # =====================================================================
 # ENDPOINT INTERNO 1-B: RUTA DIRECTA DE CONTINGENCIA (SOLO GUARDA SI HAY RIESGO)
 # =====================================================================
@@ -840,13 +908,16 @@ async def ejecutar_analisis_predictivo_fallback(
         ultimos_mantenimientos=ultimos_mantenimientos
     )
 
+    es_disparo_anomalia = (trigger_reference_id is not None) or ("anomal" in (trigger_source or "").lower())
+
     resultado_obj = _generar_informe_contingencia_mismos_datos(
         equipment=equipment,
         criticality=criticality,
         metricas_recientes=metricas_recientes,
         ultimas_fallas=ultimas_fallas,
         ultimos_mantenimientos=ultimos_mantenimientos,
-        resultado_ml=resultado_ml
+        resultado_ml=resultado_ml,
+        forzar_intervencion=es_disparo_anomalia
     )
 
     resultado_dict = resultado_obj.model_dump()
@@ -1177,7 +1248,6 @@ async def evaluar_riesgo_global_planta(db: AsyncSession) -> dict:
             .limit(5)
         )).scalars().all()
 
-        # Evaluamos el vector de datos completo usando el modelo matemático local
         resultado_ml = evaluar_metrica_actual_ml(
             equipment=equipo,
             metricas_orm=metricas_recientes,

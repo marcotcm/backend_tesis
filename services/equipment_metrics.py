@@ -18,7 +18,7 @@ from models.equipment import Equipment
 from models.equipment_metrics import EquipmentMetricHistory
 from models.user import User, UserRole
 from schemas.equipment_metrics import EquipmentMetricCreate, EquipmentMetricUpdate
-from services.ai_predictive_service import ejecutar_analisis_predictivo_ia
+from services.ai_predictive_service import ejecutar_analisis_predictivo_background
 from services.notification import trigger_global_alert
 
 
@@ -79,10 +79,8 @@ async def record_metric(
 
             # Validación dinámica para otras variables dentro de 'specific_metrics'
             if metric_in.specific_metrics:
-                for var_name, valor_actual in metric_in.specific_metrics.items(
-                    
-                ):
-                    if var_name in standard_metric:
+                for var_name, valor_actual in metric_in.specific_metrics.items():
+                    if var_name in standard_metric and valor_actual is not None:
                         s_min = standard_metric[var_name].get("min")
                         s_max = standard_metric[var_name].get("max")
                         if s_min is not None and valor_actual < s_min:
@@ -90,18 +88,18 @@ async def record_metric(
                         if s_max is not None and valor_actual > s_max:
                             disparar_ia = True
 
-            # 3. Si se supera algún estándar, lanzar el análisis profundo con Gemini en segundo plano
+            # 3. Si se supera algún estándar, lanzar alerta y encolar el análisis con sesión propia
             if disparar_ia:
-                # --- NUEVO: Disparar Notificación Global Automática ---
                 await trigger_global_alert(
                     db=db,
                     title="⚠️ Alerta: Métrica Anómala Detectada",
                     message=f"El equipo {equipment.tag_number or metric_in.equipment_id} registró valores fuera de rango operativo normal. Iniciando análisis predictivo IA."
                 )
-                
+                # Confirmar la métrica y la alerta antes de que inicie la tarea en segundo plano
+                await db.commit()
+
                 background_tasks.add_task(
-                    ejecutar_analisis_predictivo_ia,
-                    db=db,
+                    ejecutar_analisis_predictivo_background,
                     equipment_id=metric_in.equipment_id,
                     trigger_source="Anomalía en Métrica en Tiempo Real",
                     trigger_reference_id=nueva_metrica.id,
