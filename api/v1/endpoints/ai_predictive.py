@@ -9,7 +9,9 @@ from db.session import get_db
 from models.user import User
 from services.ai_predictive_service import (
     ejecutar_analisis_predictivo_ia,
+    ejecutar_analisis_predictivo_fallback,
     generar_plan_mantenimiento_ia,
+    generar_plan_mantenimiento_fallback,
     evaluar_riesgo_global_planta,
     generar_planes_mantenimiento_globales
 )
@@ -27,14 +29,14 @@ class GenerarPlanRequest(BaseModel):
 
 
 # =====================================================================
-# RUTAS INDIVIDUALES (LAS QUE YA TENÍAS)
+# RUTAS INDIVIDUALES (CON CONTINGENCIA AUTOMÁTICA SI LA IA FALLA)
 # =====================================================================
 
 @router.post(
     "/analizar-equipo/{equipment_id}",
     status_code=status.HTTP_200_OK,
     summary="Ejecutar análisis predictivo manual por IA",
-    description="Analiza el historial de 7 días, métricas, fallas, mantenimientos y criticidad de un equipo para generar recomendaciones si hay riesgo inminente."
+    description="Analiza el historial, métricas, fallas, mantenimientos y criticidad de un equipo. Solo guarda recomendación en la BD si existe probabilidad de falla."
 )
 async def analizar_equipo_manual(
     equipment_id: uuid.UUID,
@@ -43,7 +45,7 @@ async def analizar_equipo_manual(
 ):
     """
     * **Ruta:** POST /api/v1/ai-predictivo/analizar-equipo/{equipment_id}
-    * **Uso:** Dispara el análisis experto de Gemini de forma manual para un equipo específico.
+    * **Uso:** Dispara el análisis experto de Gemini (o su contingencia con los mismos datos si Gemini falla). Solo guarda recomendación si hay probabilidad de falla.
     """
     origen_disparo = f"Análisis Manual Solicitado por: {current_user.email}"
 
@@ -61,13 +63,26 @@ async def analizar_equipo_manual(
         )
         
     if resultado.get("error"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail=f"Error durante el análisis de IA: {resultado['error']}"
+        resultado = await ejecutar_analisis_predictivo_fallback(
+            db=db,
+            equipment_id=equipment_id,
+            trigger_source=origen_disparo,
+            trigger_reference_id=None
         )
+        if resultado.get("error"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, 
+                detail=f"Error durante el análisis de IA: {resultado['error']}"
+            )
+
+    mensaje_respuesta = (
+        "Análisis predictivo ejecutado con éxito. Se detectó riesgo y se guardó la recomendación."
+        if resultado.get("recomendacion_generada")
+        else "Análisis predictivo ejecutado con éxito. El equipo opera normal sin riesgo de falla (no requiere recomendación)."
+    )
 
     return {
-        "mensaje": "Análisis predictivo ejecutado con éxito.",
+        "mensaje": mensaje_respuesta,
         "resultado": resultado
     }
 
@@ -76,7 +91,7 @@ async def analizar_equipo_manual(
     "/generar-plan/{equipment_id}",
     status_code=status.HTTP_200_OK,
     summary="Generar plan de mantenimiento estructurado por IA",
-    description="Toma un diagnóstico previo y diseña un plan prescriptivo detallado (tareas, repuestos, seguridad). El plan se guarda como una recomendación pendiente de auditoría."
+    description="Toma un diagnóstico previo y diseña un plan prescriptivo detallado (tareas, repuestos, seguridad). El plan SIEMPRE se guarda como una recomendación pendiente de auditoría."
 )
 async def generar_plan_manual(
     equipment_id: uuid.UUID,
@@ -86,7 +101,7 @@ async def generar_plan_manual(
 ):
     """
     * **Ruta:** POST /api/v1/ai-predictivo/generar-plan/{equipment_id}
-    * **Uso:** Construye el contrato JSON exacto del MaintenancePlan y lo guarda para auditoría.
+    * **Uso:** Construye el contrato JSON exacto del MaintenancePlan y lo guarda siempre para auditoría.
     """
     origen_disparo = f"Generación de Plan Solicitada por: {current_user.email}"
 
@@ -104,10 +119,17 @@ async def generar_plan_manual(
         )
 
     if resultado.get("error"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail=f"Fallo en la estructuración del plan: {resultado['error']}"
+        resultado = await generar_plan_mantenimiento_fallback(
+            db=db,
+            equipment_id=equipment_id,
+            contexto_diagnostico=request.contexto_diagnostico,
+            trigger_source=origen_disparo
         )
+        if resultado.get("error"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, 
+                detail=f"Fallo en la estructuración del plan: {resultado['error']}"
+            )
 
     return {
         "mensaje": "Plan de mantenimiento generado y enviado a bandeja de auditoría.",
@@ -116,7 +138,102 @@ async def generar_plan_manual(
 
 
 # =====================================================================
-# NUEVAS RUTAS GLOBALES (NIVEL PLANTA)
+# NUEVAS RUTAS EXPLÍCITAS DE CONTINGENCIA (TOMAN LOS MISMOS DATOS)
+# =====================================================================
+
+@router.post(
+    "/analizar-equipo-contingencia/{equipment_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Ejecutar análisis predictivo de contingencia con los mismos datos reales",
+    description="Ruta de respaldo para cuando la IA falla. Toma las mismas métricas, fallas, mantenimientos y predicción ML del equipo y solo guarda recomendación si tiene probabilidad de fallar."
+)
+async def analizar_equipo_contingencia(
+    equipment_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    * **Ruta:** POST /api/v1/ai-predictivo/analizar-equipo-contingencia/{equipment_id}
+    * **Uso:** Ejecuta la evaluación determinista con los mismos datos reales de telemetría y XGBoost. Solo guarda si hay probabilidad de falla.
+    """
+    origen_disparo = f"Análisis Predictivo (Contingencia) Solicitado por: {current_user.email}"
+
+    resultado = await ejecutar_analisis_predictivo_fallback(
+        db=db,
+        equipment_id=equipment_id,
+        trigger_source=origen_disparo,
+        trigger_reference_id=None
+    )
+
+    if resultado.get("error") and "Equipo no encontrado" in str(resultado.get("error")):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Equipo no encontrado en la base de datos."
+        )
+
+    if resultado.get("error"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Error durante el análisis de contingencia: {resultado['error']}"
+        )
+
+    mensaje_respuesta = (
+        "Análisis de contingencia ejecutado con éxito. Se detectó probabilidad de falla y se guardó la recomendación."
+        if resultado.get("recomendacion_generada")
+        else "Análisis de contingencia ejecutado con éxito. El equipo opera normal sin probabilidad de falla (no se guardó recomendación)."
+    )
+
+    return {
+        "mensaje": mensaje_respuesta,
+        "resultado": resultado
+    }
+
+
+@router.post(
+    "/generar-plan-contingencia/{equipment_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Generar plan de mantenimiento de contingencia con los mismos datos reales",
+    description="Ruta de respaldo para cuando la IA falla. Diseña el plan con los mismos datos reales del equipo y SIEMPRE lo guarda en la tabla de recomendaciones."
+)
+async def generar_plan_contingencia(
+    equipment_id: uuid.UUID,
+    request: GenerarPlanRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    * **Ruta:** POST /api/v1/ai-predictivo/generar-plan-contingencia/{equipment_id}
+    * **Uso:** Construye el plan de mantenimiento con los mismos datos del equipo y lo guarda siempre en la bandeja de auditoría.
+    """
+    origen_disparo = f"Generación de Plan (Contingencia) Solicitada por: {current_user.email}"
+
+    resultado = await generar_plan_mantenimiento_fallback(
+        db=db,
+        equipment_id=equipment_id,
+        contexto_diagnostico=request.contexto_diagnostico,
+        trigger_source=origen_disparo
+    )
+
+    if resultado.get("error") and "Equipo no encontrado" in str(resultado.get("error")):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Equipo no encontrado en la base de datos."
+        )
+
+    if resultado.get("error"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Fallo en la estructuración del plan de contingencia: {resultado['error']}"
+        )
+
+    return {
+        "mensaje": "Plan de mantenimiento de contingencia generado y enviado a bandeja de auditoría.",
+        "resultado": resultado
+    }
+
+
+# =====================================================================
+# RUTAS GLOBALES (NIVEL PLANTA)
 # =====================================================================
 
 @router.get(
@@ -161,7 +278,6 @@ async def generar_planes_planta(
         trigger_source=origen_disparo
     )
     
-    # Manejo de error en caso de que el escaneo falle en generar la pauta para todos los detectados
     if resultado["planes_creados"] == 0 and len(resultado.get("errores", [])) > 0:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
