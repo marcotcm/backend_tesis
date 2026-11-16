@@ -3,9 +3,10 @@ Servicio Predictivo con Inteligencia Artificial (Heimdall RCM)
 Arquitectura Híbrida de Dos Capas:
 1. Capa ML (XGBoost/LightGBM): Análisis estadístico ultrarrápido de series de tiempo, fallas y mantenimiento.
 2. Capa Cognitiva (Gemini + Contingencia con Datos Reales): Traducción técnica, diagnóstico de causa raíz y planes prescriptivos.
-Regla de Persistencia:
-- El Análisis Predictivo SOLO se guarda en `ai_recommendations` (y notifica) si existe probabilidad de falla (>=40%), anomalía en `standard_metric` o disparo por métrica anómala.
-- El Plan de Mantenimiento SIEMPRE se guarda en `ai_recommendations` (y notifica).
+Regla de Persistencia y Notificación:
+- El Análisis Predictivo SOLO se guarda en `ai_recommendations` si existe probabilidad de falla (>=40%), estado `failed`, anomalía física o disparo por métrica anómala.
+- SIEMPRE envía notificación al finalizar un análisis manual o un plan de mantenimiento para confirmar al usuario en web y móvil.
+- El Plan de Mantenimiento SIEMPRE se guarda en `ai_recommendations`.
 """
 
 import os
@@ -132,8 +133,11 @@ def _safe_float(val, default: float = 0.0) -> float:
 def _tiene_anomalia_fisica_directa(equipment: Equipment, metrica_actual: Optional[EquipmentMetricHistory]) -> bool:
     """
     Verifica si la última lectura supera los umbrales de `standard_metric` definidos en el equipo
-    (exactamente igual que services/equipment_metrics.py) o los umbrales físicos ISO 10816-3.
+    o si el equipo está en estado `failed` o supera los umbrales físicos ISO 10816-3.
     """
+    if equipment and (equipment.operational_status or "").strip().lower() in ["failed", "falla", "critical", "out_of_service"]:
+        return True
+
     if not metrica_actual:
         return False
 
@@ -588,6 +592,21 @@ def _generar_plan_contingencia_mismos_datos(
     )
 
 
+async def _emitir_notificacion_segura(title: str, message: str, user_id: Optional[uuid.UUID] = None):
+    """Emite siempre la notificación usando una sesión limpia e independiente."""
+    async with AsyncSessionLocal() as sesion_notif:
+        try:
+            await notify_ai_analysis_ready(
+                db=sesion_notif,
+                title=title,
+                message=message,
+                user_id=user_id
+            )
+            await sesion_notif.commit()
+        except Exception as e:
+            print(f"[ERROR NOTIFICACIÓN IA] Fallo al enviar notificación: {e}")
+
+
 async def _persistir_recomendacion_segura(
     db: Optional[AsyncSession],
     payload_db: dict,
@@ -597,7 +616,7 @@ async def _persistir_recomendacion_segura(
 ):
     """
     Guarda la recomendación en `ai_recommendations` y emite la notificación `notify_ai_analysis_ready`
-    en transacciones independientes sobre una sesión limpia para que ninguna bloquee a la otra.
+    en sesiones limpias e independientes.
     """
     rec = None
     async with AsyncSessionLocal() as sesion_limpia:
@@ -615,29 +634,7 @@ async def _persistir_recomendacion_segura(
                 rec = await crud_recommendation.create(db, payload_db)
                 await db.commit()
 
-        # Disparar siempre la notificación en bloque separado para asegurar que llegue por BD, WebSocket y Push
-        if rec:
-            try:
-                await notify_ai_analysis_ready(
-                    db=sesion_limpia,
-                    title=notif_title,
-                    message=notif_msg,
-                    user_id=user_id
-                )
-                await sesion_limpia.commit()
-            except Exception as notif_err:
-                print(f"[WARN NOTIFICACIÓN IA] Error con user_id={user_id}, reintentando global ({notif_err})...")
-                try:
-                    await notify_ai_analysis_ready(
-                        db=sesion_limpia,
-                        title=notif_title,
-                        message=notif_msg,
-                        user_id=None
-                    )
-                    await sesion_limpia.commit()
-                except Exception as e2:
-                    print(f"[ERROR NOTIFICACIÓN IA] No se pudo emitir la notificación: {e2}")
-
+    await _emitir_notificacion_segura(title=notif_title, message=notif_msg, user_id=user_id)
     return rec
 
 
@@ -648,7 +645,8 @@ async def _ejecutar_analisis_predictivo_core(
     db: AsyncSession,
     equipment_id: uuid.UUID,
     trigger_source: str,
-    trigger_reference_id: uuid.UUID | None = None
+    trigger_reference_id: uuid.UUID | None = None,
+    user_id: Optional[uuid.UUID] = None
 ) -> dict:
     """Núcleo del análisis predictivo sobre una sesión activa y verificada."""
     equipment = (await db.execute(select(Equipment).where(Equipment.id == equipment_id))).scalar_one_or_none()
@@ -779,7 +777,7 @@ async def _ejecutar_analisis_predictivo_core(
 
     try:
         respuesta = await client.aio.models.generate_content(
-            model="gemini-3.1-flash-lite",
+            model="gemini-2.5-flash",
             contents=contexto_tecnico,
             config=configuracion
         )
@@ -796,7 +794,7 @@ async def _ejecutar_analisis_predictivo_core(
             forzar_intervencion=(es_disparo_anomalia or hay_anomalia_fisica or hay_riesgo_ml)
         )
 
-    # Si fue disparado por una métrica anómala real, o el ML es >= 40%, o supera standard_metric, asegurar que se guarde
+    # Si fue disparado por una métrica anómala real, o el ML es >= 40%, o supera standard_metric / estado failed, asegurar que se guarde
     if es_disparo_anomalia or hay_riesgo_ml or hay_anomalia_fisica:
         resultado_obj.requiere_intervencion = True
         if resultado_obj.prediction_type == "Operación Normal":
@@ -805,11 +803,12 @@ async def _ejecutar_analisis_predictivo_core(
     resultado_dict = resultado_obj.model_dump()
     resultado_dict["probabilidad_ml"] = resultado_ml["probabilidad_falla"]
 
-    # 7. GENERACIÓN DEL REPORTE TEXTUAL Y GUARDADO SOLO SI TIENE PROBABILIDAD DE FALLAR / ANOMALÍA
+    # 7. GUARDADO EN BD SOLO SI REQUIERE INTERVENCIÓN, PERO NOTIFICACIÓN SIEMPRE
     recomendacion_creada = None
+    prob_pct = round(resultado_ml["probabilidad_falla"] * 100, 1)
+    target_user_id = user_id or getattr(metrica_mas_reciente, "recorded_by", None) or getattr(equipment, "created_by", None)
 
     if resultado_obj.requiere_intervencion:
-        prob_pct = round(resultado_ml["probabilidad_falla"] * 100, 1)
         confianza_pct = int(resultado_obj.confianza * 100)
         normas_str = ", ".join(resultado_obj.normas_aplicadas) if resultado_obj.normas_aplicadas else "ISO 14224, SAE JA1011"
         plan_accion_str = "\n".join([f"  {i}. {accion}" for i, accion in enumerate(resultado_obj.plan_accion, start=1)])
@@ -838,13 +837,18 @@ async def _ejecutar_analisis_predictivo_core(
             "status": "Pendiente"
         }
 
-        target_user_id = getattr(metrica_mas_reciente, "recorded_by", None) or getattr(equipment, "created_by", None)
-
         recomendacion_creada = await _persistir_recomendacion_segura(
             db=db,
             payload_db=payload_db,
-            notif_title="🧠 Análisis Predictivo IA Listo",
-            notif_msg=f"La IA ha generado un dictamen técnico de riesgo ({prob_pct}%) para el equipo {equipment.tag_number}.",
+            notif_title="🧠 Análisis Predictivo IA Listo (Riesgo Detectado)",
+            notif_msg=f"La IA ha generado un dictamen de riesgo ({prob_pct}%) para el equipo {equipment.tag_number}.",
+            user_id=target_user_id
+        )
+    else:
+        # Si el equipo está sano, no se guarda recomendación en Auditoría IA, pero SÍ se notifica al usuario que su análisis manual terminó
+        await _emitir_notificacion_segura(
+            title="✅ Análisis Predictivo IA Completado",
+            message=f"El equipo {equipment.tag_number} ({equipment.name}) opera en condición normal (Riesgo ML: {prob_pct}%). No requiere intervención.",
             user_id=target_user_id
         )
 
@@ -859,12 +863,11 @@ async def ejecutar_analisis_predictivo_ia(
     db: Optional[AsyncSession], 
     equipment_id: uuid.UUID, 
     trigger_source: str, 
-    trigger_reference_id: uuid.UUID | None = None
+    trigger_reference_id: uuid.UUID | None = None,
+    user_id: Optional[uuid.UUID] = None
 ) -> dict:
     """
     Punto de entrada principal para análisis predictivo.
-    Si es llamado desde un BackgroundTask (ej. cuando `trigger_reference_id` está presente o `db` es None),
-    abre siempre una sesión independiente con `AsyncSessionLocal()` para evitar sesiones huérfanas/cerradas.
     """
     if db is None or trigger_reference_id is not None:
         async with AsyncSessionLocal() as bg_db:
@@ -872,14 +875,16 @@ async def ejecutar_analisis_predictivo_ia(
                 db=bg_db,
                 equipment_id=equipment_id,
                 trigger_source=trigger_source,
-                trigger_reference_id=trigger_reference_id
+                trigger_reference_id=trigger_reference_id,
+                user_id=user_id
             )
 
     return await _ejecutar_analisis_predictivo_core(
         db=db,
         equipment_id=equipment_id,
         trigger_source=trigger_source,
-        trigger_reference_id=trigger_reference_id
+        trigger_reference_id=trigger_reference_id,
+        user_id=user_id
     )
 
 
@@ -890,7 +895,6 @@ async def ejecutar_analisis_predictivo_background(
 ) -> dict:
     """
     Función dedicada para `background_tasks.add_task(...)` en `services/equipment_metrics.py`.
-    No recibe la sesión del request HTTP sino que crea su propia `AsyncSessionLocal`.
     """
     async with AsyncSessionLocal() as bg_db:
         return await _ejecutar_analisis_predictivo_core(
@@ -908,11 +912,12 @@ async def ejecutar_analisis_predictivo_fallback(
     db: AsyncSession,
     equipment_id: uuid.UUID,
     trigger_source: str,
-    trigger_reference_id: uuid.UUID | None = None
+    trigger_reference_id: uuid.UUID | None = None,
+    user_id: Optional[uuid.UUID] = None
 ) -> dict:
     """
     Ruta de contingencia directa que toma los mismos datos reales del equipo y del modelo ML.
-    SOLO guarda la recomendación en PostgreSQL si existe probabilidad de falla / requiere intervención.
+    SOLO guarda la recomendación en PostgreSQL si existe probabilidad de falla / requiere intervención, pero siempre notifica.
     """
     equipment = (await db.execute(select(Equipment).where(Equipment.id == equipment_id))).scalar_one_or_none()
     if not equipment:
@@ -952,9 +957,11 @@ async def ejecutar_analisis_predictivo_fallback(
     resultado_dict["probabilidad_ml"] = resultado_ml["probabilidad_falla"]
 
     recomendacion_creada = None
+    prob_pct = round(resultado_ml["probabilidad_falla"] * 100, 1)
+    metrica_mas_reciente = metricas_recientes[0] if metricas_recientes else None
+    target_user_id = user_id or getattr(metrica_mas_reciente, "recorded_by", None) or getattr(equipment, "created_by", None)
 
     if resultado_obj.requiere_intervencion:
-        prob_pct = round(resultado_ml["probabilidad_falla"] * 100, 1)
         confianza_pct = int(resultado_obj.confianza * 100)
         normas_str = ", ".join(resultado_obj.normas_aplicadas)
         plan_accion_str = "\n".join([f"  {i}. {accion}" for i, accion in enumerate(resultado_obj.plan_accion, start=1)])
@@ -983,14 +990,17 @@ async def ejecutar_analisis_predictivo_fallback(
             "status": "Pendiente"
         }
 
-        metrica_mas_reciente = metricas_recientes[0] if metricas_recientes else None
-        target_user_id = getattr(metrica_mas_reciente, "recorded_by", None) or getattr(equipment, "created_by", None)
-
         recomendacion_creada = await _persistir_recomendacion_segura(
             db=db,
             payload_db=payload_db,
-            notif_title="🧠 Análisis Predictivo IA Listo",
-            notif_msg=f"La IA ha generado un dictamen técnico de riesgo ({prob_pct}%) para el equipo {equipment.tag_number}.",
+            notif_title="🧠 Análisis Predictivo IA Listo (Riesgo Detectado)",
+            notif_msg=f"La IA ha generado un dictamen de riesgo ({prob_pct}%) para el equipo {equipment.tag_number}.",
+            user_id=target_user_id
+        )
+    else:
+        await _emitir_notificacion_segura(
+            title="✅ Análisis Predictivo IA Completado",
+            message=f"El equipo {equipment.tag_number} ({equipment.name}) opera en condición normal (Riesgo ML: {prob_pct}%). No requiere intervención.",
             user_id=target_user_id
         )
 
@@ -1008,7 +1018,8 @@ async def generar_plan_mantenimiento_ia(
     db: AsyncSession, 
     equipment_id: uuid.UUID,
     contexto_diagnostico: str,
-    trigger_source: str = "Asistente IA - Generación de Plan"
+    trigger_source: str = "Asistente IA - Generación de Plan",
+    user_id: Optional[uuid.UUID] = None
 ) -> dict:
     """
     Toma el diagnóstico de riesgo previo (de Gemini o manual) y estructura 
@@ -1119,7 +1130,7 @@ async def generar_plan_mantenimiento_ia(
         "status": "Pendiente"
     }
 
-    target_user_id = getattr(equipment, "created_by", None)
+    target_user_id = user_id or getattr(equipment, "created_by", None)
 
     recomendacion_creada = await _persistir_recomendacion_segura(
         db=db,
@@ -1151,7 +1162,8 @@ async def generar_plan_mantenimiento_fallback(
     db: AsyncSession,
     equipment_id: uuid.UUID,
     contexto_diagnostico: str,
-    trigger_source: str = "Asistente IA - Generación de Plan (Contingencia)"
+    trigger_source: str = "Asistente IA - Generación de Plan (Contingencia)",
+    user_id: Optional[uuid.UUID] = None
 ) -> dict:
     """Genera y guarda siempre el plan de mantenimiento directamente con los datos del equipo sin llamar a Gemini."""
     equipment = (await db.execute(select(Equipment).where(Equipment.id == equipment_id))).scalar_one_or_none()
@@ -1220,7 +1232,7 @@ async def generar_plan_mantenimiento_fallback(
         "status": "Pendiente"
     }
 
-    target_user_id = getattr(equipment, "created_by", None)
+    target_user_id = user_id or getattr(equipment, "created_by", None)
 
     recomendacion_creada = await _persistir_recomendacion_segura(
         db=db,
@@ -1318,7 +1330,7 @@ async def evaluar_riesgo_global_planta(db: AsyncSession) -> dict:
 # =====================================================================
 # ENDPOINT INTERNO 4: GENERACIÓN EN LOTE DE PAUTAS DE MANTENIMIENTO
 # =====================================================================
-async def generar_planes_mantenimiento_globales(db: AsyncSession, trigger_source: str) -> dict:
+async def generar_planes_mantenimiento_globales(db: AsyncSession, trigger_source: str, user_id: Optional[uuid.UUID] = None) -> dict:
     """
     Función de Orquestación (Batch).
     1. Llama al Radar Predictivo (ML) para ubicar a las máquinas enfermas.
@@ -1342,7 +1354,8 @@ async def generar_planes_mantenimiento_globales(db: AsyncSession, trigger_source
             db=db,
             equipment_id=uuid.UUID(equipo_alerta["equipment_id"]),
             contexto_diagnostico=contexto_diagnostico,
-            trigger_source=trigger_source
+            trigger_source=trigger_source,
+            user_id=user_id
         )
         
         if resultado_plan.get("error"):
