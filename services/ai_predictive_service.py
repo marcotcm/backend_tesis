@@ -4,8 +4,8 @@ Arquitectura Híbrida de Dos Capas:
 1. Capa ML (XGBoost/LightGBM): Análisis estadístico ultrarrápido de series de tiempo, fallas y mantenimiento.
 2. Capa Cognitiva (Gemini + Contingencia con Datos Reales): Traducción técnica, diagnóstico de causa raíz y planes prescriptivos.
 Regla de Persistencia:
-- El Análisis Predictivo SOLO se guarda en `ai_recommendations` si existe probabilidad de falla (>=40%), anomalía en `standard_metric` o disparo por métrica anómala.
-- El Plan de Mantenimiento SIEMPRE se guarda en `ai_recommendations`.
+- El Análisis Predictivo SOLO se guarda en `ai_recommendations` (y notifica) si existe probabilidad de falla (>=40%), anomalía en `standard_metric` o disparo por métrica anómala.
+- El Plan de Mantenimiento SIEMPRE se guarda en `ai_recommendations` (y notifica).
 """
 
 import os
@@ -142,18 +142,18 @@ def _tiene_anomalia_fisica_directa(equipment: Equipment, metrica_actual: Optiona
         standard_metric = equipment.technical_specifications.get("standard_metric", {})
         if isinstance(standard_metric, dict):
             if "temperature_celsius" in standard_metric and metrica_actual.temperature_celsius is not None:
-                t_Limits = standard_metric["temperature_celsius"]
-                if isinstance(t_Limits, dict):
-                    t_min = t_Limits.get("min", -50)
-                    t_max = t_Limits.get("max", 1000)
+                t_limits = standard_metric["temperature_celsius"]
+                if isinstance(t_limits, dict):
+                    t_min = t_limits.get("min", -50)
+                    t_max = t_limits.get("max", 1000)
                     if metrica_actual.temperature_celsius < t_min or metrica_actual.temperature_celsius > t_max:
                         return True
 
             if "vibration_mm_s" in standard_metric and metrica_actual.vibration_mm_s is not None:
-                v_Limits = standard_metric["vibration_mm_s"]
-                if isinstance(v_Limits, dict):
-                    v_min = v_Limits.get("min", 0)
-                    v_max = v_Limits.get("max", 100)
+                v_limits = standard_metric["vibration_mm_s"]
+                if isinstance(v_limits, dict):
+                    v_min = v_limits.get("min", 0)
+                    v_max = v_limits.get("max", 100)
                     if metrica_actual.vibration_mm_s < v_min or metrica_actual.vibration_mm_s > v_max:
                         return True
 
@@ -588,10 +588,18 @@ def _generar_plan_contingencia_mismos_datos(
     )
 
 
-async def _persistir_recomendacion_segura(db: Optional[AsyncSession], payload_db: dict, notif_title: str, notif_msg: str):
+async def _persistir_recomendacion_segura(
+    db: Optional[AsyncSession],
+    payload_db: dict,
+    notif_title: str,
+    notif_msg: str,
+    user_id: Optional[uuid.UUID] = None
+):
     """
-    Guarda la recomendación y dispara la notificación usando una sesión limpia garantizada.
+    Guarda la recomendación en `ai_recommendations` y emite la notificación `notify_ai_analysis_ready`
+    en transacciones independientes sobre una sesión limpia para que ninguna bloquee a la otra.
     """
+    rec = None
     async with AsyncSessionLocal() as sesion_limpia:
         try:
             rec = await crud_recommendation.create(sesion_limpia, payload_db)
@@ -601,19 +609,36 @@ async def _persistir_recomendacion_segura(db: Optional[AsyncSession], payload_db
                     await sesion_limpia.refresh(rec)
                 except Exception:
                     pass
-                await notify_ai_analysis_ready(db=sesion_limpia, title=notif_title, message=notif_msg, user_id=None)
-                await sesion_limpia.commit()
-            return rec
         except Exception as e:
-            print(f"[ERROR DB] Fallo guardando con AsyncSessionLocal ({e}). Intentando con sesión recibida...")
+            print(f"[ERROR DB RECOMENDACIÓN] Fallo guardando recomendación ({e}).")
             if db is not None:
                 rec = await crud_recommendation.create(db, payload_db)
                 await db.commit()
-                if rec:
-                    await notify_ai_analysis_ready(db=db, title=notif_title, message=notif_msg, user_id=None)
-                    await db.commit()
-                return rec
-            raise e
+
+        # Disparar siempre la notificación en bloque separado para asegurar que llegue por BD, WebSocket y Push
+        if rec:
+            try:
+                await notify_ai_analysis_ready(
+                    db=sesion_limpia,
+                    title=notif_title,
+                    message=notif_msg,
+                    user_id=user_id
+                )
+                await sesion_limpia.commit()
+            except Exception as notif_err:
+                print(f"[WARN NOTIFICACIÓN IA] Error con user_id={user_id}, reintentando global ({notif_err})...")
+                try:
+                    await notify_ai_analysis_ready(
+                        db=sesion_limpia,
+                        title=notif_title,
+                        message=notif_msg,
+                        user_id=None
+                    )
+                    await sesion_limpia.commit()
+                except Exception as e2:
+                    print(f"[ERROR NOTIFICACIÓN IA] No se pudo emitir la notificación: {e2}")
+
+    return rec
 
 
 # =====================================================================
@@ -813,11 +838,14 @@ async def _ejecutar_analisis_predictivo_core(
             "status": "Pendiente"
         }
 
+        target_user_id = getattr(metrica_mas_reciente, "recorded_by", None) or getattr(equipment, "created_by", None)
+
         recomendacion_creada = await _persistir_recomendacion_segura(
             db=db,
             payload_db=payload_db,
             notif_title="🧠 Análisis Predictivo IA Listo",
-            notif_msg=f"La IA ha generado un dictamen técnico de riesgo para el equipo {equipment.tag_number}."
+            notif_msg=f"La IA ha generado un dictamen técnico de riesgo ({prob_pct}%) para el equipo {equipment.tag_number}.",
+            user_id=target_user_id
         )
 
     return {
@@ -955,11 +983,15 @@ async def ejecutar_analisis_predictivo_fallback(
             "status": "Pendiente"
         }
 
+        metrica_mas_reciente = metricas_recientes[0] if metricas_recientes else None
+        target_user_id = getattr(metrica_mas_reciente, "recorded_by", None) or getattr(equipment, "created_by", None)
+
         recomendacion_creada = await _persistir_recomendacion_segura(
             db=db,
             payload_db=payload_db,
             notif_title="🧠 Análisis Predictivo IA Listo",
-            notif_msg=f"La IA ha generado un dictamen técnico de riesgo para el equipo {equipment.tag_number}."
+            notif_msg=f"La IA ha generado un dictamen técnico de riesgo ({prob_pct}%) para el equipo {equipment.tag_number}.",
+            user_id=target_user_id
         )
 
     return {
@@ -981,7 +1013,7 @@ async def generar_plan_mantenimiento_ia(
     """
     Toma el diagnóstico de riesgo previo (de Gemini o manual) y estructura 
     un plan de mantenimiento riguroso con repuestos, roles y seguridad.
-    SIEMPRE guarda el plan en la tabla de recomendaciones.
+    SIEMPRE guarda el plan en la tabla de recomendaciones y envía notificación.
     """
     equipment = (await db.execute(select(Equipment).where(Equipment.id == equipment_id))).scalar_one_or_none()
     if not equipment:
@@ -1087,11 +1119,14 @@ async def generar_plan_mantenimiento_ia(
         "status": "Pendiente"
     }
 
+    target_user_id = getattr(equipment, "created_by", None)
+
     recomendacion_creada = await _persistir_recomendacion_segura(
         db=db,
         payload_db=payload_db,
         notif_title="📋 Plan de Mantenimiento IA Estructurado",
-        notif_msg=f"Se ha estructurado un plan '{plan_obj.title}' para el equipo {equipment.tag_number}."
+        notif_msg=f"Se ha estructurado un plan '{plan_obj.title}' para el equipo {equipment.tag_number}.",
+        user_id=target_user_id
     )
 
     plan_final = {
@@ -1185,11 +1220,14 @@ async def generar_plan_mantenimiento_fallback(
         "status": "Pendiente"
     }
 
+    target_user_id = getattr(equipment, "created_by", None)
+
     recomendacion_creada = await _persistir_recomendacion_segura(
         db=db,
         payload_db=payload_db,
         notif_title="📋 Plan de Mantenimiento IA Estructurado",
-        notif_msg=f"Se ha estructurado un plan '{plan_obj.title}' para el equipo {equipment.tag_number}."
+        notif_msg=f"Se ha estructurado un plan '{plan_obj.title}' para el equipo {equipment.tag_number}.",
+        user_id=target_user_id
     )
 
     plan_final = {
