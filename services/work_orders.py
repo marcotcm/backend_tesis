@@ -79,8 +79,22 @@ async def update_work_order_record(
     update_data = wo_in.model_dump(exclude_unset=True)
     if not update_data:
         return db_wo
-        
-    return await crud_wo.update_work_order(db, db_obj=db_wo, update_data=update_data)
+
+    previous_assignee = db_wo.assigned_to
+    updated_wo = await crud_wo.update_work_order(db, db_obj=db_wo, update_data=update_data)
+
+    if updated_wo.assigned_to and updated_wo.assigned_to != previous_assignee:
+        try:
+            await notify_work_order_assignment(
+                db=db,
+                user_id=updated_wo.assigned_to,
+                title="🛠️ Nueva Orden de Trabajo Asignada",
+                message=f"Se te ha asignado la OT ({updated_wo.id}) para ejecución en campo.",
+            )
+        except Exception as notif_err:
+            print(f"[WARN NOTIF OT UPDATE] No se pudo notificar asignación: {notif_err}")
+
+    return updated_wo
 
 async def cancel_work_order(db: AsyncSession, wo_id: uuid.UUID, current_user: User) -> dict:
     """

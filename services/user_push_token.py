@@ -33,3 +33,7 @@ async def register_token(
 
 async def unregister_token(db: AsyncSession, user_id: uuid.UUID, token: str) -> None:
     await crud_user_push_token.deactivate_token(db, user_id, token)
+
+
+async def deactivate_tokens_by_value(db: AsyncSession, tokens: list[str]) -> None:
+    await crud_user_push_token.deactivate_tokens_by_value(db, tokens)

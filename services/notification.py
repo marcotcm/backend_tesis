@@ -54,36 +54,77 @@ async def _resolver_user_id_por_defecto(db: AsyncSession, user_id: Optional[uuid
 
 
 # Integración con Expo Push Notifications
-async def send_expo_push_notifications(tokens: List[str], title: str, message: str, data: dict = None):
-    valid_tokens = list({t.strip() for t in tokens if t and isinstance(t, str) and t.strip()})
+async def send_expo_push_notifications(
+    tokens: List[str],
+    title: str,
+    message: str,
+    data: dict = None,
+    channel_id: str = "default",
+    db: Optional[AsyncSession] = None,
+):
+    valid_tokens = list({
+        t.strip()
+        for t in tokens
+        if t
+        and isinstance(t, str)
+        and (t.strip().startswith("ExponentPushToken[") or t.strip().startswith("ExpoPushToken["))
+    })
     if not valid_tokens:
-        print(f"[INFO PUSH] No hay tokens en user_push_tokens para enviar: '{title}'")
+        print(f"[INFO PUSH] No hay tokens Expo válidos en user_push_tokens para enviar: '{title}'")
         return
 
-    messages = [{
-        "to": token,
-        "title": title,
-        "body": message,
-        "sound": "default",
-        "priority": "high",
-        "channelId": "default",
-        "data": data or {}
-    } for token in valid_tokens]
+    invalid_tokens: List[str] = []
+    chunk_size = 100
 
     async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            res = await client.post(
-                "https://exp.host/--/api/v2/push/send",
-                json=messages,
-                headers={
-                    "Accept": "application/json",
-                    "Accept-encoding": "gzip, deflate",
-                    "Content-Type": "application/json"
+        for i in range(0, len(valid_tokens), chunk_size):
+            batch_tokens = valid_tokens[i : i + chunk_size]
+            messages = [
+                {
+                    "to": token,
+                    "title": title,
+                    "body": message,
+                    "sound": "default",
+                    "priority": "high",
+                    "channelId": channel_id,
+                    "data": data or {},
                 }
-            )
-            print(f"[EXPO PUSH] Enviado a {len(valid_tokens)} dispositivo(s) | Status: {res.status_code}")
-        except Exception as e:
-            print(f"[ERROR PUSH] Fallo enviando notificación Expo: {e}")
+                for token in batch_tokens
+            ]
+
+            try:
+                res = await client.post(
+                    "https://exp.host/--/api/v2/push/send",
+                    json=messages,
+                    headers={
+                        "Accept": "application/json",
+                        "Accept-encoding": "gzip, deflate",
+                        "Content-Type": "application/json",
+                    },
+                )
+                print(f"[EXPO PUSH] Lote ({len(batch_tokens)} disp.) | Canal: {channel_id} | Status: {res.status_code}")
+
+                try:
+                    resp_json = res.json()
+                    tickets = resp_json.get("data", []) if isinstance(resp_json, dict) else []
+                    for token, ticket in zip(batch_tokens, tickets):
+                        if isinstance(ticket, dict) and ticket.get("status") == "error":
+                            err_code = (ticket.get("details") or {}).get("error", "UnknownError")
+                            err_msg = ticket.get("message", "")
+                            print(f"[ERROR EXPO TICKET] token={token[:28]}... error={err_code} msg={err_msg}")
+                            if err_code == "DeviceNotRegistered":
+                                invalid_tokens.append(token)
+                except Exception as parse_err:
+                    print(f"[WARN PUSH] No se pudo parsear respuesta de Expo: {parse_err}")
+            except Exception as e:
+                print(f"[ERROR PUSH] Fallo enviando notificación Expo: {e}")
+
+    if invalid_tokens and db is not None:
+        try:
+            await push_service.deactivate_tokens_by_value(db, invalid_tokens)
+            print(f"[INFO PUSH] Desactivados {len(invalid_tokens)} token(s) DeviceNotRegistered.")
+        except Exception as cleanup_err:
+            print(f"[WARN PUSH] Error limpiando tokens inválidos: {cleanup_err}")
 
 
 # ==============================================================================
@@ -113,7 +154,14 @@ async def trigger_global_alert(db: AsyncSession, title: str, message: str, user_
     try:
         tokens_db = await push_service.list_all_tokens(db)
         tokens = [t.token for t in tokens_db]
-        await send_expo_push_notifications(tokens, title, message, data=ws_payload)
+        await send_expo_push_notifications(
+            tokens,
+            title,
+            message,
+            data=ws_payload,
+            channel_id="rcm_critical_alerts",
+            db=db,
+        )
     except Exception as e:
         print(f"[ERROR PUSH ALERTA] {e}")
 
@@ -145,7 +193,7 @@ async def notify_ai_analysis_ready(db: AsyncSession, title: str, message: str, u
     try:
         tokens_db = await push_service.list_all_tokens(db)
         tokens = [t.token for t in tokens_db]
-        await send_expo_push_notifications(tokens, title, message, data=ws_payload)
+        await send_expo_push_notifications(tokens, title, message, data=ws_payload, channel_id="default", db=db)
     except Exception as e:
         print(f"[ERROR PUSH IA] {e}")
 
@@ -177,7 +225,7 @@ async def notify_work_order_assignment(db: AsyncSession, user_id: uuid.UUID, tit
         if not tokens_db:
             tokens_db = await push_service.list_all_tokens(db)
         tokens = [t.token for t in tokens_db]
-        await send_expo_push_notifications(tokens, title, message, data=ws_payload)
+        await send_expo_push_notifications(tokens, title, message, data=ws_payload, channel_id="default", db=db)
     except Exception as e:
         print(f"[ERROR PUSH OT] {e}")
 
@@ -208,7 +256,7 @@ async def notify_new_maintenance(db: AsyncSession, title: str, message: str, use
     try:
         tokens_db = await push_service.list_all_tokens(db)
         tokens = [t.token for t in tokens_db]
-        await send_expo_push_notifications(tokens, title, message, data=ws_payload)
+        await send_expo_push_notifications(tokens, title, message, data=ws_payload, channel_id="default", db=db)
     except Exception as e:
         print(f"[ERROR PUSH MANTENIMIENTO] {e}")
 

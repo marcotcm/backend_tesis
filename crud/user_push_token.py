@@ -15,7 +15,10 @@ async def list_user_tokens(
 ) -> list[UserPushToken]:
     result = await db.execute(
         select(UserPushToken)
-        .where(UserPushToken.user_id == user_id)
+        .where(
+            UserPushToken.user_id == user_id,
+            UserPushToken.is_active.is_(True),
+        )
         .order_by(UserPushToken.created_at.desc())
         .offset(skip)
         .limit(limit)
@@ -30,6 +33,7 @@ async def list_all_tokens(
 ) -> list[UserPushToken]:
     result = await db.execute(
         select(UserPushToken)
+        .where(UserPushToken.is_active.is_(True))
         .order_by(UserPushToken.created_at.desc())
         .offset(skip)
         .limit(limit)
@@ -70,6 +74,23 @@ async def deactivate_token(db: AsyncSession, user_id: uuid.UUID, token: str) -> 
         .where(
             UserPushToken.user_id == user_id,
             UserPushToken.token == token,
+            UserPushToken.is_active.is_(True),
+        )
+        .values(is_active=False, updated_at=func.now())
+    )
+    await db.execute(statement)
+    await db.commit()
+
+
+async def deactivate_tokens_by_value(db: AsyncSession, tokens: list[str]) -> None:
+    """Desactiva tokens inválidos o no registrados reportados por Expo Push (DeviceNotRegistered)."""
+    clean_tokens = [t.strip() for t in tokens if t and isinstance(t, str) and t.strip()]
+    if not clean_tokens:
+        return
+    statement = (
+        update(UserPushToken)
+        .where(
+            UserPushToken.token.in_(clean_tokens),
             UserPushToken.is_active.is_(True),
         )
         .values(is_active=False, updated_at=func.now())
