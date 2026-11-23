@@ -9,6 +9,8 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.session import get_db
+from core.security import get_current_user
+from models.user import User
 from schemas.maintenance import MaintenanceCreate, MaintenanceResponse, MaintenanceUpdate
 from services import maintenance as maintenance_service
 
@@ -24,11 +26,12 @@ router = APIRouter()
 async def crear_mantenimiento(
     maintenance_in: MaintenanceCreate,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     * **Ruta:** POST /api/v1/mantenimientos/
-    * **Token:** No requiere actualmente.
-    * **Nivel de permiso:** Público.
+    * **Token:** Requiere (Bearer JWT).
+    * **Nivel de permiso:** Usuario Autenticado.
     * **Uso:** Registra un plan de mantenimiento preventivo, predictivo,
       correctivo o adaptativo basado en IA.
     * **Resultado:** Crea el mantenimiento si el equipo asociado existe.
@@ -47,11 +50,12 @@ async def listar_mantenimientos(
     limit: int = Query(100, ge=1, le=500),
     equipment_id: Optional[uuid.UUID] = Query(None),
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     * **Ruta:** GET /api/v1/mantenimientos/
-    * **Token:** No requiere actualmente.
-    * **Nivel de permiso:** Público.
+    * **Token:** Requiere (Bearer JWT).
+    * **Nivel de permiso:** Usuario Autenticado.
     * **Uso:** Consulta planes de mantenimiento con paginación y filtro opcional por equipo.
     * **Resultado:** Retorna los mantenimientos registrados ordenados desde el más reciente.
     """
@@ -70,11 +74,12 @@ async def listar_mantenimientos(
 async def obtener_mantenimiento(
     id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     * **Ruta:** GET /api/v1/mantenimientos/{id}
-    * **Token:** No requiere actualmente.
-    * **Nivel de permiso:** Público.
+    * **Token:** Requiere (Bearer JWT).
+    * **Nivel de permiso:** Usuario Autenticado.
     * **Uso:** Consulta un plan de mantenimiento mediante su UUID.
     * **Resultado:** Retorna el mantenimiento solicitado o un error 404 si no existe.
     """
@@ -91,11 +96,12 @@ async def actualizar_mantenimiento(
     id: uuid.UUID,
     maintenance_in: MaintenanceUpdate,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     * **Ruta:** PATCH /api/v1/mantenimientos/{id}
-    * **Token:** No requiere actualmente.
-    * **Nivel de permiso:** Público.
+    * **Token:** Requiere (Bearer JWT).
+    * **Nivel de permiso:** Usuario Autenticado.
     * **Uso:** Actualiza parcialmente el plan, tipo, frecuencia o estado.
     * **Resultado:** Retorna el mantenimiento actualizado después de validar el equipo.
     """
@@ -111,11 +117,12 @@ async def actualizar_mantenimiento(
 async def desactivar_mantenimiento(
     id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     * **Ruta:** DELETE /api/v1/mantenimientos/{id}
-    * **Token:** No requiere actualmente.
-    * **Nivel de permiso:** Público.
+    * **Token:** Requiere (Bearer JWT).
+    * **Nivel de permiso:** Usuario Autenticado.
     * **Uso:** Da de baja lógicamente un plan de mantenimiento.
     * **Resultado:** Retorna el mantenimiento inactivo con su fecha de baja.
     """

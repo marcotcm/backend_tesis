@@ -25,7 +25,12 @@ class WorkOrderStats(BaseModel):
 
 class FailureStats(BaseModel):
     total_recorded: int
-    average_downtime_hours: Optional[float]
+    average_downtime_hours: Optional[float] = None
+    total_downtime_hours: Optional[float] = None
+    total_operating_hours: Optional[float] = None
+    mtbf_hours: Optional[float] = None
+    mttr_hours: Optional[float] = None
+    inherent_availability_pct: Optional[float] = None
 
 
 class RecentActivity(BaseModel):

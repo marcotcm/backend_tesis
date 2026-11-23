@@ -127,9 +127,51 @@ async def get_failure_stats(db: AsyncSession) -> dict[str, Any]:
             func.avg(FailureHistory.downtime_hours).label(
                 "average_downtime_hours"
             ),
+            func.coalesce(func.sum(FailureHistory.downtime_hours), 0.0).label(
+                "total_downtime_hours"
+            ),
         )
     )
-    return dict(result.mappings().one())
+    failure_row = dict(result.mappings().one())
+
+    active_equipment = Equipment.is_active.is_(True) & Equipment.deleted_at.is_(None)
+    op_result = await db.execute(
+        select(
+            func.count(Equipment.id).label("active_count"),
+            func.coalesce(func.sum(Equipment.usage_time), 0).label("total_usage_minutes"),
+        ).where(active_equipment)
+    )
+    op_row = op_result.mappings().one()
+    active_count = int(op_row["active_count"] or 0)
+    total_usage_minutes = float(op_row["total_usage_minutes"] or 0.0)
+
+    total_recorded = int(failure_row["total_recorded"] or 0)
+    avg_downtime = (
+        float(failure_row["average_downtime_hours"])
+        if failure_row["average_downtime_hours"] is not None
+        else None
+    )
+    total_downtime = round(float(failure_row["total_downtime_hours"] or 0.0), 2)
+
+    if total_usage_minutes > 0:
+        total_operating_hours = round(total_usage_minutes / 60.0, 1)
+    else:
+        total_operating_hours = round(max(active_count, 1) * 720.0, 1)
+
+    mtbf_hours = round(total_operating_hours / max(total_recorded, 1), 1)
+    mttr_hours = round(avg_downtime if avg_downtime is not None else 0.0, 1)
+    denom = mtbf_hours + mttr_hours
+    inherent_availability_pct = round((mtbf_hours / denom) * 100.0, 2) if denom > 0 else 100.0
+
+    return {
+        "total_recorded": total_recorded,
+        "average_downtime_hours": avg_downtime,
+        "total_downtime_hours": total_downtime,
+        "total_operating_hours": total_operating_hours,
+        "mtbf_hours": mtbf_hours,
+        "mttr_hours": mttr_hours,
+        "inherent_availability_pct": inherent_availability_pct,
+    }
 
 
 async def get_recent_activity(
