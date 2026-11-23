@@ -6,6 +6,7 @@ Carga y valida las variables de entorno requeridas desde el archivo .env,
 tales como cadenas de conexión a base de datos y credenciales de Supabase.
 """
 
+from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -20,6 +21,9 @@ class Settings(BaseSettings):
     SUPABASE_ANON_KEY: str
     SUPABASE_SERVICE_ROLE_KEY: str
     SUPABASE_JWT_SECRET: str
+
+    # Llave opcional Machine-to-Machine para gateways Edge IoT (X-IoT-Key)
+    IOT_INGEST_API_KEY: Optional[str] = None
 
     model_config = SettingsConfigDict(
         env_file=".env",

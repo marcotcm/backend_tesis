@@ -1,5 +1,5 @@
 import uuid
-from typing import Optional
+from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, Field
@@ -16,6 +16,9 @@ from services.ai_predictive_service import (
     evaluar_riesgo_global_planta,
     generar_planes_mantenimiento_globales,
     obtener_estado_gemelo_digital,
+    actualizar_topologia_gemelo_digital,
+    simular_escenario_gemelo_digital,
+    aplicar_consigna_scada_equipo,
 )
 
 router = APIRouter()
@@ -28,6 +31,41 @@ class GenerarPlanRequest(BaseModel):
         ..., 
         description="Diagnóstico predictivo previo o contexto técnico manual para que la IA diseñe el plan de mantenimiento."
     )
+
+
+class TopologiaNodoItem(BaseModel):
+    equipment_id: uuid.UUID
+    stage: Optional[str] = None
+    pid_position: Optional[dict] = None
+    pid_connections: Optional[List[dict]] = None
+
+
+class ActualizarTopologiaRequest(BaseModel):
+    nodes: List[TopologiaNodoItem] = Field(..., min_length=1)
+
+
+class SimulacionOverrideItem(BaseModel):
+    equipment_id: uuid.UUID
+    vibration_mm_s: Optional[float] = Field(default=None, ge=0, le=50)
+    temperature_celsius: Optional[float] = Field(default=None, ge=-50, le=500)
+    pressure_psi: Optional[float] = Field(default=None, ge=0, le=10000)
+    flow_rate: Optional[float] = Field(default=None, ge=0)
+    motor_amps: Optional[float] = Field(default=None, ge=0)
+    valve_open_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    operational_status: Optional[str] = None
+
+
+class SimularGemeloRequest(BaseModel):
+    taxonomy_id: Optional[uuid.UUID] = None
+    overrides: List[SimulacionOverrideItem] = Field(default_factory=list)
+
+
+class ConsignaScadaRequest(BaseModel):
+    valve_open_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    rpm_setpoint: Optional[float] = Field(default=None, ge=0, le=20000)
+    pressure_setpoint_psi: Optional[float] = Field(default=None, ge=0, le=10000)
+    mode: Optional[str] = Field(default=None)
+    edge_webhook_url: Optional[str] = Field(default=None)
 
 
 # =====================================================================
@@ -233,8 +271,8 @@ async def generar_plan_contingencia(
 @router.get(
     "/gemelo-digital",
     status_code=status.HTTP_200_OK,
-    summary="Estado en tiempo real del Gemelo Digital (Telemetría + XGBoost + Topología)",
-    description="Devuelve todos los activos reales activos con su última telemetría, deltas, predicción XGBoost, criticidad, órdenes activas y etapa topológica P&ID."
+    summary="Estado en tiempo real del Gemelo Digital (Telemetría + Topología + Pronóstico)",
+    description="Devuelve todos los activos activos con su última telemetría, deltas, predicción de riesgo, criticidad, órdenes activas, coordenadas P&ID y enlaces."
 )
 async def consultar_gemelo_digital(
     taxonomy_id: Optional[uuid.UUID] = Query(None, description="Filtrar por categoría de taxonomía"),
@@ -245,6 +283,71 @@ async def consultar_gemelo_digital(
     return {
         "mensaje": "Estado del Gemelo Digital sincronizado en tiempo real.",
         "resultado": resultado
+    }
+
+
+@router.put(
+    "/gemelo-digital/topologia",
+    status_code=status.HTTP_200_OK,
+    summary="Guardar topología P&ID personalizada (coordenadas y enlaces nodo-a-nodo)"
+)
+async def actualizar_topologia_pid(
+    payload: ActualizarTopologiaRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    resultado = await actualizar_topologia_gemelo_digital(
+        db=db,
+        nodes_layout=[n.model_dump() for n in payload.nodes],
+        user_id=current_user.id,
+    )
+    return {
+        "mensaje": f"Topología P&ID actualizada en {resultado['updated_count']} activos.",
+        "resultado": resultado,
+    }
+
+
+@router.post(
+    "/gemelo-digital/simular",
+    status_code=status.HTTP_200_OK,
+    summary="Simulador What-If en cascada (no destructivo)"
+)
+async def simular_gemelo_digital(
+    payload: SimularGemeloRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    resultado = await simular_escenario_gemelo_digital(
+        db=db,
+        overrides=[ov.model_dump() for ov in payload.overrides],
+        taxonomy_id=payload.taxonomy_id,
+    )
+    return {
+        "mensaje": "Escenario What-If calculado en memoria sin modificar datos históricos.",
+        "resultado": resultado,
+    }
+
+
+@router.post(
+    "/gemelo-digital/consigna/{equipment_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Emitir consigna operativa SCADA (válvula, RPM, presión, modo AUTO/MANUAL)"
+)
+async def enviar_consigna_scada(
+    equipment_id: uuid.UUID,
+    payload: ConsignaScadaRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    resultado = await aplicar_consigna_scada_equipo(
+        db=db,
+        equipment_id=equipment_id,
+        consigna=payload.model_dump(exclude_unset=True),
+        current_user=current_user,
+    )
+    return {
+        "mensaje": f"Consigna SCADA aplicada en {resultado['tag_number']}.",
+        "resultado": resultado,
     }
 
 

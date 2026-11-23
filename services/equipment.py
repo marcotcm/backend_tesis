@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from crud import equipment as crud_equipment
 from crud import equipment_taxonomy as crud_taxonomy
 from schemas.equipment import EquipmentCreate, EquipmentUpdate, UsageTimeUpdate
+from services.realtime_twin_hub import twin_hub
 
 async def create_equipment(db: AsyncSession, equipment_in: EquipmentCreate, user_id: uuid.UUID) -> dict:
     """
@@ -58,7 +59,17 @@ async def update_equipment(db: AsyncSession, equipment_id: uuid.UUID, equipment_
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El número de tag ya se encuentra asignado a otro equipo.")
 
     update_data["updated_by"] = user_id
-    return await crud_equipment.update_equipment(db, equipment, update_data)
+    updated = await crud_equipment.update_equipment(db, equipment, update_data)
+    await twin_hub.broadcast_event(
+        "equipment_updated",
+        {
+            "equipment_id": str(equipment_id),
+            "tag_number": updated.tag_number,
+            "operational_status": updated.operational_status,
+        },
+        taxonomy_id=str(updated.taxonomy_id) if updated.taxonomy_id else None,
+    )
+    return updated
 
 async def update_equipment_usage_time(db: AsyncSession, equipment_id: uuid.UUID, usage_in: UsageTimeUpdate, user_id: uuid.UUID):
     """

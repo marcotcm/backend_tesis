@@ -10,7 +10,11 @@ Regla de Persistencia y Notificación:
 """
 
 import os
+import ipaddress
 import uuid
+from types import SimpleNamespace
+from urllib.parse import urlparse
+import httpx
 import pandas as pd
 import joblib
 from typing import Literal, List, Optional
@@ -18,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm.attributes import flag_modified
 from pydantic import BaseModel, Field, ValidationError
 
 from google import genai
@@ -35,8 +40,10 @@ from models.ai_correction import AICorrection
 from models.equipment_taxonomy import EquipmentTaxonomy
 from models.maintenance import Maintenance
 from models.work_orders import WorkOrder
+from models.user import User
 from crud import ai_recommendation as crud_recommendation
 from services.notification import notify_ai_analysis_ready
+from services.realtime_twin_hub import twin_hub
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -1396,13 +1403,14 @@ def _resolver_etapa_pid(equipment: Equipment) -> str:
 
 def _evaluar_anomalias_nodo(
     equipment: Equipment,
-    metrica_actual: Optional[EquipmentMetricHistory],
-    resultado_ml: dict
+    metrica_actual,
+    resultado_ml: dict,
+    operational_status_override: Optional[str] = None,
 ) -> List[str]:
     anomalias: List[str] = []
-    op_status = (equipment.operational_status or "").strip().lower()
+    op_status = (operational_status_override or equipment.operational_status or "").strip().lower()
     if op_status in ("failed", "falla", "critical", "out_of_service"):
-        anomalias.append(f"Estado operativo en PostgreSQL: {op_status.upper()}.")
+        anomalias.append(f"Estado operativo reportado en planta: {op_status.upper()}.")
     elif op_status in ("under_maintenance", "maintenance"):
         anomalias.append("Equipo en intervención de mantenimiento programada.")
 
@@ -1416,7 +1424,10 @@ def _evaluar_anomalias_nodo(
         t = float(metrica_actual.temperature_celsius)
         t_bounds = std.get("temperature_celsius") if isinstance(std.get("temperature_celsius"), dict) else {}
         t_min = _safe_float(t_bounds.get("min"), -50.0)
-        t_max = _safe_float(t_bounds.get("max"), 95.0 if identificar_categoria_equipo(equipment)["is_compresor"] else (48.0 if identificar_categoria_equipo(equipment)["is_tanque"] else 80.0))
+        t_max = _safe_float(
+            t_bounds.get("max"),
+            95.0 if identificar_categoria_equipo(equipment)["is_compresor"] else (48.0 if identificar_categoria_equipo(equipment)["is_tanque"] else 80.0),
+        )
         if t > t_max or t < t_min:
             anomalias.append(f"Temperatura ({t:.1f} °C) fuera de estándar ({t_min}–{t_max} °C).")
 
@@ -1443,21 +1454,141 @@ def _evaluar_anomalias_nodo(
 
     prob_ml = float(resultado_ml.get("probabilidad_falla") or 0.0)
     if prob_ml >= 0.70:
-        anomalias.append(f"Modelo XGBoost detecta riesgo crítico de falla <48h ({round(prob_ml * 100, 1)}%).")
+        anomalias.append(f"Pronóstico predictivo detecta riesgo crítico de falla <48h ({round(prob_ml * 100, 1)}%).")
     elif prob_ml >= 0.40:
-        anomalias.append(f"Modelo XGBoost detecta riesgo moderado de falla ({round(prob_ml * 100, 1)}%).")
+        anomalias.append(f"Pronóstico predictivo detecta riesgo moderado de falla ({round(prob_ml * 100, 1)}%).")
 
     return anomalias
 
 
-async def obtener_estado_gemelo_digital(
-    db: AsyncSession,
-    taxonomy_id: Optional[uuid.UUID] = None
-) -> dict:
-    """
-    Construye el estado completo en tiempo real del Gemelo Digital P&ID usando
-    100% datos reales de PostgreSQL y evaluando cada equipo con XGBoost.
-    """
+def _extraer_topologia_y_actuadores(specs: dict, valid_ids: set[str]) -> tuple:
+    raw_pos = specs.get("pid_position")
+    pid_position = None
+    if isinstance(raw_pos, dict) and raw_pos.get("x") is not None and raw_pos.get("y") is not None:
+        try:
+            pid_position = {"x": float(raw_pos["x"]), "y": float(raw_pos["y"])}
+        except (ValueError, TypeError):
+            pid_position = None
+
+    raw_conns = specs.get("pid_connections")
+    pid_connections = []
+    if isinstance(raw_conns, list):
+        for idx, conn in enumerate(raw_conns):
+            if not isinstance(conn, dict):
+                continue
+            target_id = str(conn.get("target_id") or "").strip()
+            if not target_id or target_id not in valid_ids:
+                continue
+            line_type = str(conn.get("line_type") or "process").strip().lower()
+            if line_type not in ("process", "gas", "water", "bypass"):
+                line_type = "process"
+            pid_connections.append({
+                "id": str(conn.get("id") or f"line-{idx}"),
+                "target_id": target_id,
+                "line_type": line_type,
+                "valve_tag": str(conn.get("valve_tag") or f"XV-{idx + 1:02d}"),
+                "valve_open_pct": max(0.0, min(100.0, _safe_float(conn.get("valve_open_pct"), 100.0))),
+            })
+
+    raw_act = specs.get("scada_actuators") if isinstance(specs.get("scada_actuators"), dict) else {}
+    scada_actuators = {
+        "valve_open_pct": max(0.0, min(100.0, _safe_float(raw_act.get("valve_open_pct"), 100.0))),
+        "rpm_setpoint": _safe_float(raw_act.get("rpm_setpoint"), None) if raw_act.get("rpm_setpoint") is not None else None,
+        "pressure_setpoint_psi": _safe_float(raw_act.get("pressure_setpoint_psi"), None) if raw_act.get("pressure_setpoint_psi") is not None else None,
+        "mode": str(raw_act.get("mode") or "AUTO").upper(),
+        "edge_webhook_url": raw_act.get("edge_webhook_url") or None,
+        "updated_at": raw_act.get("updated_at"),
+    }
+    return pid_position, pid_connections, scada_actuators
+
+
+def _evaluar_salud_y_estado_nodo(
+    equipment: Equipment,
+    metrica_actual,
+    prob_ml: float,
+    anomalias: List[str],
+    has_telemetry: bool,
+    operational_status_override: Optional[str] = None,
+) -> tuple[int, str]:
+    op_lower = (operational_status_override or equipment.operational_status or "operational").strip().lower()
+
+    # Verificar anomalía física directa incluyendo posible override operativo
+    anomalia_fisica = _tiene_anomalia_fisica_directa(equipment, metrica_actual)
+    if op_lower in ("failed", "critical", "falla", "out_of_service"):
+        health_score = max(10, round(min(40.0, 100.0 - prob_ml * 85.0)))
+    elif has_telemetry:
+        base_health = 100.0 - (prob_ml * 62.0)
+        if anomalia_fisica:
+            base_health -= 22.0
+        if op_lower in ("under_maintenance", "maintenance"):
+            base_health = min(base_health, 75.0)
+        health_score = max(5, min(100, round(base_health)))
+    else:
+        health_score = 68 if op_lower in ("under_maintenance", "maintenance") else (85 if op_lower == "standby" else 100)
+
+    if op_lower in ("failed", "critical", "falla", "out_of_service") or prob_ml >= 0.70 or health_score < 55:
+        node_status = "critical"
+    elif op_lower in ("under_maintenance", "maintenance") or prob_ml >= 0.40 or len(anomalias) > 0 or health_score < 80:
+        node_status = "warning"
+    else:
+        node_status = "normal"
+
+    return health_score, node_status
+
+
+def _formatear_metricas_nodo(metrica_actual, metrica_previa, metricas_recientes: list) -> tuple[Optional[dict], list]:
+    latest_metric_payload = None
+    if metrica_actual:
+        sm = metrica_actual.specific_metrics if isinstance(metrica_actual.specific_metrics, dict) else {}
+        pressure_val = sm.get("presion_descarga_psi", sm.get("pressure_psi", sm.get("internal_pressure_psi", sm.get("thpPsi"))))
+        flow_val = sm.get("caudal_bpd", sm.get("flow_rate_bpd", sm.get("flowRateBpd", sm.get("caudal_mmscfd"))))
+        amps_val = sm.get("motorAmps", sm.get("current_amps"))
+        level_val = sm.get("liquid_level_percentage", sm.get("level_percent"))
+
+        delta_vib = (
+            round(float(metrica_actual.vibration_mm_s) - float(metrica_previa.vibration_mm_s), 2)
+            if metrica_previa and metrica_actual.vibration_mm_s is not None and metrica_previa.vibration_mm_s is not None
+            else None
+        )
+        delta_temp = (
+            round(float(metrica_actual.temperature_celsius) - float(metrica_previa.temperature_celsius), 1)
+            if metrica_previa and metrica_actual.temperature_celsius is not None and metrica_previa.temperature_celsius is not None
+            else None
+        )
+
+        rec_at = getattr(metrica_actual, "recorded_at", None)
+        latest_metric_payload = {
+            "id": str(getattr(metrica_actual, "id", uuid.uuid4())),
+            "temperature_celsius": float(metrica_actual.temperature_celsius) if metrica_actual.temperature_celsius is not None else None,
+            "vibration_mm_s": float(metrica_actual.vibration_mm_s) if metrica_actual.vibration_mm_s is not None else None,
+            "operating_hours": float(metrica_actual.operating_hours) if metrica_actual.operating_hours is not None else None,
+            "pressure_psi": _safe_float(pressure_val, None) if pressure_val is not None else None,
+            "flow_rate": _safe_float(flow_val, None) if flow_val is not None else None,
+            "motor_amps": _safe_float(amps_val, None) if amps_val is not None else None,
+            "liquid_level_pct": _safe_float(level_val, None) if level_val is not None else None,
+            "specific_metrics": sm,
+            "notes": getattr(metrica_actual, "notes", None),
+            "recorded_at": rec_at.isoformat() if rec_at else None,
+            "delta_vib": delta_vib,
+            "delta_temp": delta_temp,
+        }
+
+    recent_series = []
+    for m in reversed(metricas_recientes[:10]):
+        m_sm = m.specific_metrics if isinstance(m.specific_metrics, dict) else {}
+        m_press = m_sm.get("presion_descarga_psi", m_sm.get("pressure_psi", m_sm.get("internal_pressure_psi")))
+        m_rec_at = getattr(m, "recorded_at", None)
+        recent_series.append({
+            "recorded_at": m_rec_at.isoformat() if m_rec_at else None,
+            "vibration_mm_s": float(m.vibration_mm_s) if m.vibration_mm_s is not None else None,
+            "temperature_celsius": float(m.temperature_celsius) if m.temperature_celsius is not None else None,
+            "pressure_psi": _safe_float(m_press, None) if m_press is not None else None,
+        })
+
+    return latest_metric_payload, recent_series
+
+
+async def _cargar_contexto_gemelo(db: AsyncSession, taxonomy_id: Optional[uuid.UUID] = None) -> tuple:
     eq_stmt = select(Equipment).where(Equipment.is_active == True, Equipment.deleted_at.is_(None))
     if taxonomy_id is not None:
         eq_stmt = eq_stmt.where(Equipment.taxonomy_id == taxonomy_id)
@@ -1480,6 +1611,20 @@ async def obtener_estado_gemelo_digital(
     active_wo_count_map: dict[uuid.UUID, int] = {}
     for eq_id_row, _ in wo_rows:
         active_wo_count_map[eq_id_row] = active_wo_count_map.get(eq_id_row, 0) + 1
+
+    return equipos_activos, taxonomies_rows, tax_map, crit_map, active_wo_count_map
+
+
+async def obtener_estado_gemelo_digital(
+    db: AsyncSession,
+    taxonomy_id: Optional[uuid.UUID] = None
+) -> dict:
+    """
+    Construye el estado completo en tiempo real del Gemelo Digital P&ID usando
+    datos reales de planta, topología personalizada y evaluación predictiva.
+    """
+    equipos_activos, taxonomies_rows, tax_map, crit_map, active_wo_count_map = await _cargar_contexto_gemelo(db, taxonomy_id)
+    valid_ids = {str(eq.id) for eq in equipos_activos}
 
     nodos = []
     for eq in equipos_activos:
@@ -1532,75 +1677,12 @@ async def obtener_estado_gemelo_digital(
             }
 
         anomalias = _evaluar_anomalias_nodo(eq, metrica_actual, resultado_ml)
-        anomalia_fisica = _tiene_anomalia_fisica_directa(eq, metrica_actual)
         prob_ml = float(resultado_ml.get("probabilidad_falla") or 0.0)
-        op_lower = (eq.operational_status or "operational").strip().lower()
+        health_score, node_status = _evaluar_salud_y_estado_nodo(eq, metrica_actual, prob_ml, anomalias, has_telemetry)
+        latest_metric_payload, recent_series = _formatear_metricas_nodo(metrica_actual, metrica_previa, metricas_recientes)
 
-        # Cálculo de salud real del nodo combinando XGBoost, estado operativo y desviación física
-        if op_lower in ("failed", "critical", "falla", "out_of_service"):
-            health_score = max(10, round(min(40.0, 100.0 - prob_ml * 85.0)))
-        elif has_telemetry:
-            base_health = 100.0 - (prob_ml * 62.0)
-            if anomalia_fisica:
-                base_health -= 22.0
-            if op_lower in ("under_maintenance", "maintenance"):
-                base_health = min(base_health, 75.0)
-            health_score = max(5, min(100, round(base_health)))
-        else:
-            health_score = 68 if op_lower in ("under_maintenance", "maintenance") else (85 if op_lower == "standby" else 100)
-
-        if op_lower in ("failed", "critical", "falla", "out_of_service") or prob_ml >= 0.70 or health_score < 55:
-            node_status = "critical"
-        elif op_lower in ("under_maintenance", "maintenance") or prob_ml >= 0.40 or len(anomalias) > 0 or health_score < 80:
-            node_status = "warning"
-        else:
-            node_status = "normal"
-
-        latest_metric_payload = None
-        if metrica_actual:
-            sm = metrica_actual.specific_metrics if isinstance(metrica_actual.specific_metrics, dict) else {}
-            pressure_val = sm.get("presion_descarga_psi", sm.get("pressure_psi", sm.get("internal_pressure_psi", sm.get("thpPsi"))))
-            flow_val = sm.get("caudal_bpd", sm.get("flow_rate_bpd", sm.get("flowRateBpd", sm.get("caudal_mmscfd"))))
-            amps_val = sm.get("motorAmps", sm.get("current_amps"))
-            level_val = sm.get("liquid_level_percentage", sm.get("level_percent"))
-
-            delta_vib = (
-                round(float(metrica_actual.vibration_mm_s) - float(metrica_previa.vibration_mm_s), 2)
-                if metrica_previa and metrica_actual.vibration_mm_s is not None and metrica_previa.vibration_mm_s is not None
-                else None
-            )
-            delta_temp = (
-                round(float(metrica_actual.temperature_celsius) - float(metrica_previa.temperature_celsius), 1)
-                if metrica_previa and metrica_actual.temperature_celsius is not None and metrica_previa.temperature_celsius is not None
-                else None
-            )
-
-            latest_metric_payload = {
-                "id": str(metrica_actual.id),
-                "temperature_celsius": float(metrica_actual.temperature_celsius) if metrica_actual.temperature_celsius is not None else None,
-                "vibration_mm_s": float(metrica_actual.vibration_mm_s) if metrica_actual.vibration_mm_s is not None else None,
-                "operating_hours": float(metrica_actual.operating_hours) if metrica_actual.operating_hours is not None else None,
-                "pressure_psi": _safe_float(pressure_val, None) if pressure_val is not None else None,
-                "flow_rate": _safe_float(flow_val, None) if flow_val is not None else None,
-                "motor_amps": _safe_float(amps_val, None) if amps_val is not None else None,
-                "liquid_level_pct": _safe_float(level_val, None) if level_val is not None else None,
-                "specific_metrics": sm,
-                "notes": metrica_actual.notes,
-                "recorded_at": metrica_actual.recorded_at.isoformat() if metrica_actual.recorded_at else None,
-                "delta_vib": delta_vib,
-                "delta_temp": delta_temp,
-            }
-
-        recent_series = []
-        for m in reversed(metricas_recientes[:10]):
-            m_sm = m.specific_metrics if isinstance(m.specific_metrics, dict) else {}
-            m_press = m_sm.get("presion_descarga_psi", m_sm.get("pressure_psi", m_sm.get("internal_pressure_psi")))
-            recent_series.append({
-                "recorded_at": m.recorded_at.isoformat() if m.recorded_at else None,
-                "vibration_mm_s": float(m.vibration_mm_s) if m.vibration_mm_s is not None else None,
-                "temperature_celsius": float(m.temperature_celsius) if m.temperature_celsius is not None else None,
-                "pressure_psi": _safe_float(m_press, None) if m_press is not None else None,
-            })
+        specs = eq.technical_specifications if isinstance(eq.technical_specifications, dict) else {}
+        pid_position, pid_connections, scada_actuators = _extraer_topologia_y_actuadores(specs, valid_ids)
 
         crit = crit_map.get(eq.id)
         tax = tax_map.get(eq.taxonomy_id)
@@ -1620,6 +1702,9 @@ async def obtener_estado_gemelo_digital(
             "taxonomy_id": str(eq.taxonomy_id) if eq.taxonomy_id else None,
             "taxonomy_name": tax.name if tax else "Planta General",
             "stage": _resolver_etapa_pid(eq),
+            "pid_position": pid_position,
+            "pid_connections": pid_connections,
+            "scada_actuators": scada_actuators,
             "criticality_level": crit.criticality_level if crit else None,
             "rpn_score": crit.rpn_score if crit else None,
             "has_telemetry": has_telemetry,
@@ -1642,7 +1727,7 @@ async def obtener_estado_gemelo_digital(
                 if ultima_rec
                 else None
             ),
-            "technical_specifications": eq.technical_specifications or {},
+            "technical_specifications": specs,
         })
 
     avg_health = round(sum(n["health_score"] for n in nodos) / len(nodos), 1) if nodos else 100.0
@@ -1672,4 +1757,478 @@ async def obtener_estado_gemelo_digital(
             for t in taxonomies_rows
         ],
         "nodes": nodos,
+    }
+
+
+async def actualizar_topologia_gemelo_digital(
+    db: AsyncSession,
+    nodes_layout: List[dict],
+    user_id: uuid.UUID,
+) -> dict:
+    """Guarda coordenadas libres (x, y), etapa P&ID y conexiones nodo-a-nodo en lote."""
+    if not nodes_layout:
+        return {"updated_count": 0}
+
+    target_ids = []
+    for item in nodes_layout:
+        try:
+            target_ids.append(uuid.UUID(str(item["equipment_id"])))
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    eq_rows = (
+        await db.execute(
+            select(Equipment).where(Equipment.id.in_(target_ids), Equipment.deleted_at.is_(None))
+        )
+    ).scalars().all()
+    eq_map = {str(eq.id): eq for eq in eq_rows}
+
+    updated_count = 0
+    for item in nodes_layout:
+        eq_id = str(item.get("equipment_id") or "")
+        eq = eq_map.get(eq_id)
+        if not eq:
+            continue
+
+        specs = dict(eq.technical_specifications or {}) if isinstance(eq.technical_specifications, dict) else {}
+
+        if item.get("stage") in ("upstream", "central", "downstream"):
+            specs["pid_stage"] = item["stage"]
+
+        if "pid_position" in item:
+            pos = item["pid_position"]
+            if pos is None:
+                specs.pop("pid_position", None)
+            elif isinstance(pos, dict) and pos.get("x") is not None and pos.get("y") is not None:
+                specs["pid_position"] = {"x": round(float(pos["x"]), 1), "y": round(float(pos["y"]), 1)}
+
+        if "pid_connections" in item and isinstance(item["pid_connections"], list):
+            cleaned_conns = []
+            for idx, conn in enumerate(item["pid_connections"]):
+                if not isinstance(conn, dict) or not conn.get("target_id"):
+                    continue
+                line_type = str(conn.get("line_type") or "process").strip().lower()
+                if line_type not in ("process", "gas", "water", "bypass"):
+                    line_type = "process"
+                cleaned_conns.append({
+                    "id": str(conn.get("id") or f"line-{idx}"),
+                    "target_id": str(conn["target_id"]),
+                    "line_type": line_type,
+                    "valve_tag": str(conn.get("valve_tag") or f"XV-{idx + 1:02d}"),
+                    "valve_open_pct": max(0.0, min(100.0, _safe_float(conn.get("valve_open_pct"), 100.0))),
+                })
+            specs["pid_connections"] = cleaned_conns
+
+        eq.technical_specifications = specs
+        eq.updated_by = user_id
+        flag_modified(eq, "technical_specifications")
+        updated_count += 1
+
+    if updated_count > 0:
+        await db.commit()
+        await twin_hub.broadcast_event("topology_updated", {"updated_count": updated_count})
+
+    return {"updated_count": updated_count}
+
+
+async def simular_escenario_gemelo_digital(
+    db: AsyncSession,
+    overrides: List[dict],
+    taxonomy_id: Optional[uuid.UUID] = None,
+) -> dict:
+    """
+    Ejecuta simulación What-If en cascada 100% en memoria (cero escrituras en BD).
+    Calcula impacto hidráulico/térmico aguas abajo y re-evalúa el modelo ML.
+    """
+    equipos_activos, _, tax_map, crit_map, active_wo_count_map = await _cargar_contexto_gemelo(db, taxonomy_id)
+    valid_ids = {str(eq.id) for eq in equipos_activos}
+
+    override_map = {}
+    for ov in overrides:
+        eq_id_str = str(ov.get("equipment_id") or "").strip()
+        if eq_id_str:
+            override_map[eq_id_str] = ov
+
+    # 1. Recolectar histórico real y baseline de cada equipo
+    node_ctx = {}
+    for eq in equipos_activos:
+        eid = str(eq.id)
+        metricas_recientes = (await db.execute(
+            select(EquipmentMetricHistory)
+            .where(EquipmentMetricHistory.equipment_id == eq.id)
+            .order_by(EquipmentMetricHistory.recorded_at.desc())
+            .limit(15)
+        )).scalars().all()
+
+        ultimas_fallas = (await db.execute(
+            select(FailureHistory)
+            .where(FailureHistory.equipment_id == eq.id)
+            .order_by(FailureHistory.failure_date.desc())
+            .limit(5)
+        )).scalars().all()
+
+        ultimos_mantenimientos = (await db.execute(
+            select(MaintenanceHistory)
+            .where(MaintenanceHistory.equipment_id == eq.id)
+            .order_by(MaintenanceHistory.execution_date.desc())
+            .limit(5)
+        )).scalars().all()
+
+        has_real = len(metricas_recientes) > 0
+        m_actual = metricas_recientes[0] if has_real else None
+        base_ml = (
+            evaluar_metrica_actual_ml(eq, metricas_recientes, ultimas_fallas, ultimos_mantenimientos)
+            if has_real
+            else {"probabilidad_falla": 0.0, "clasificacion_alerta": "SIN TELEMETRIA", "salto_amperaje": 0.0, "dias_ultima_falla": None, "dias_ultimo_mantenimiento": None}
+        )
+        base_anom = _evaluar_anomalias_nodo(eq, m_actual, base_ml)
+        base_prob = float(base_ml.get("probabilidad_falla") or 0.0)
+        base_health, base_status = _evaluar_salud_y_estado_nodo(eq, m_actual, base_prob, base_anom, has_real)
+
+        specs = eq.technical_specifications if isinstance(eq.technical_specifications, dict) else {}
+        pid_position, pid_connections, scada_actuators = _extraer_topologia_y_actuadores(specs, valid_ids)
+        cat_flags = identificar_categoria_equipo(eq)
+        family = "tank" if cat_flags["is_tanque"] else ("compressor" if cat_flags["is_compresor"] else "pump")
+
+        base_sm = dict(m_actual.specific_metrics) if m_actual and isinstance(m_actual.specific_metrics, dict) else {}
+        base_press = _safe_float(base_sm.get("presion_descarga_psi", base_sm.get("pressure_psi", base_sm.get("internal_pressure_psi"))), None)
+        base_flow = _safe_float(base_sm.get("caudal_bpd", base_sm.get("flow_rate_bpd", base_sm.get("flowRateBpd", base_sm.get("caudal_mmscfd")))), None)
+        base_amps = _safe_float(base_sm.get("motorAmps", base_sm.get("current_amps")), None)
+
+        node_ctx[eid] = {
+            "eq": eq,
+            "family": family,
+            "stage": _resolver_etapa_pid(eq),
+            "metricas_recientes": metricas_recientes,
+            "ultimas_fallas": ultimas_fallas,
+            "ultimos_mantenimientos": ultimos_mantenimientos,
+            "has_real": has_real,
+            "m_actual": m_actual,
+            "base_health": base_health,
+            "base_status": base_status,
+            "base_prob": base_prob,
+            "pid_position": pid_position,
+            "pid_connections": pid_connections,
+            "scada_actuators": scada_actuators,
+            "vib": float(m_actual.vibration_mm_s) if m_actual and m_actual.vibration_mm_s is not None else 1.8,
+            "temp": float(m_actual.temperature_celsius) if m_actual and m_actual.temperature_celsius is not None else (38.0 if family == "tank" else 60.0),
+            "press": base_press if base_press is not None else (420.0 if family == "compressor" else 180.0),
+            "flow": base_flow,
+            "amps": base_amps,
+            "valve_pct": scada_actuators["valve_open_pct"],
+            "op_status": eq.operational_status,
+            "base_flow": base_flow,
+            "base_press": base_press,
+            "cascade_notes": [],
+            "is_overridden": eid in override_map,
+            "is_cascade": False,
+        }
+
+        # Aplicar perturbación directa solicitada
+        if eid in override_map:
+            ov = override_map[eid]
+            if ov.get("vibration_mm_s") is not None:
+                node_ctx[eid]["vib"] = float(ov["vibration_mm_s"])
+            if ov.get("temperature_celsius") is not None:
+                node_ctx[eid]["temp"] = float(ov["temperature_celsius"])
+            if ov.get("pressure_psi") is not None:
+                node_ctx[eid]["press"] = float(ov["pressure_psi"])
+            if ov.get("flow_rate") is not None:
+                node_ctx[eid]["flow"] = float(ov["flow_rate"])
+            if ov.get("motor_amps") is not None:
+                node_ctx[eid]["amps"] = float(ov["motor_amps"])
+            if ov.get("valve_open_pct") is not None:
+                node_ctx[eid]["valve_pct"] = max(0.0, min(100.0, float(ov["valve_open_pct"])))
+            if ov.get("operational_status"):
+                node_ctx[eid]["op_status"] = str(ov["operational_status"])
+
+    # 2. Construir grafo dirigido (conexiones explícitas o colectores por etapa)
+    incoming_edges: dict[str, list[tuple[str, float]]] = {eid: [] for eid in node_ctx}
+    has_explicit_edges = any(len(ctx["pid_connections"]) > 0 for ctx in node_ctx.values())
+    if has_explicit_edges:
+        for src_id, ctx in node_ctx.items():
+            for conn in ctx["pid_connections"]:
+                tgt_id = conn["target_id"]
+                if tgt_id in incoming_edges:
+                    incoming_edges[tgt_id].append((src_id, conn["valve_open_pct"]))
+    else:
+        up_ids = [eid for eid, c in node_ctx.items() if c["stage"] == "upstream"]
+        cen_ids = [eid for eid, c in node_ctx.items() if c["stage"] == "central"]
+        down_ids = [eid for eid, c in node_ctx.items() if c["stage"] == "downstream"]
+        mid_ids = cen_ids if cen_ids else down_ids
+        for u in up_ids:
+            for m in mid_ids:
+                incoming_edges[m].append((u, node_ctx[u]["valve_pct"]))
+        if cen_ids:
+            for c_id in cen_ids:
+                for d in down_ids:
+                    incoming_edges[d].append((c_id, node_ctx[c_id]["valve_pct"]))
+
+    def _node_delivery_factor(ctx: dict) -> float:
+        op = str(ctx["op_status"] or "operational").lower()
+        if op in ("failed", "critical", "falla", "out_of_service", "inactive"):
+            return 0.0
+        valve_ratio = max(0.0, min(1.0, ctx["valve_pct"] / 100.0))
+        flow_ratio = 1.0
+        if ctx["base_flow"] and ctx["base_flow"] > 0 and ctx["flow"] is not None:
+            flow_ratio = max(0.0, min(1.5, ctx["flow"] / ctx["base_flow"]))
+        return valve_ratio * flow_ratio
+
+    # 2 pasadas para propagar aguas arriba -> central -> aguas abajo
+    stage_order = {"upstream": 0, "central": 1, "downstream": 2}
+    ordered_eids = sorted(node_ctx.keys(), key=lambda k: stage_order.get(node_ctx[k]["stage"], 1))
+    for _ in range(2):
+        for eid in ordered_eids:
+            edges = incoming_edges.get(eid) or []
+            if not edges or node_ctx[eid]["is_overridden"]:
+                continue
+
+            total_weight = 0.0
+            for src_id, conn_valve in edges:
+                src_ctx = node_ctx[src_id]
+                src_delivery = _node_delivery_factor(src_ctx)
+                edge_valve_ratio = max(0.0, min(1.0, min(conn_valve, src_ctx["valve_pct"]) / 100.0))
+                total_weight += src_delivery * (edge_valve_ratio if src_ctx["valve_pct"] > 0 else 0.0)
+
+            avg_incoming = total_weight / len(edges)
+            if avg_incoming < 0.88:
+                ctx = node_ctx[eid]
+                ctx["is_cascade"] = True
+                if ctx["base_flow"] is not None:
+                    ctx["flow"] = round(ctx["base_flow"] * avg_incoming, 1)
+                if ctx["base_press"] is not None:
+                    ctx["press"] = round(ctx["base_press"] * max(0.2, avg_incoming), 1)
+
+                cascade_msg = f"Impacto en cascada: restricción de suministro aguas arriba ({round(avg_incoming * 100)}% flujo)."
+                if avg_incoming < 0.72 and ctx["family"] in ("pump", "compressor"):
+                    vib_bump = round((0.85 - avg_incoming) * 6.0, 2)
+                    temp_bump = round((0.85 - avg_incoming) * 20.0, 1)
+                    ctx["vib"] = round((ctx["m_actual"].vibration_mm_s if ctx["m_actual"] and ctx["m_actual"].vibration_mm_s is not None else 2.0) + vib_bump, 2)
+                    ctx["temp"] = round((ctx["m_actual"].temperature_celsius if ctx["m_actual"] and ctx["m_actual"].temperature_celsius is not None else 62.0) + temp_bump, 1)
+                    cascade_msg = f"Impacto en cascada: baja succión induce cavitación / sobrecarga térmica (+{vib_bump} mm/s, +{temp_bump} °C)."
+                if cascade_msg not in ctx["cascade_notes"]:
+                    ctx["cascade_notes"].append(cascade_msg)
+
+    # 3. Re-evaluar salud y ML en memoria
+    sim_nodes = []
+    impacted_count = 0
+    for eid in ordered_eids:
+        ctx = node_ctx[eid]
+        eq = ctx["eq"]
+        should_eval_sim = ctx["is_overridden"] or ctx["is_cascade"]
+
+        if should_eval_sim:
+            base_m = ctx["m_actual"]
+            sim_sm = dict(base_m.specific_metrics) if base_m and isinstance(base_m.specific_metrics, dict) else {}
+            if ctx["press"] is not None:
+                sim_sm["presion_descarga_psi"] = ctx["press"]
+            if ctx["flow"] is not None:
+                sim_sm["caudal_bpd"] = ctx["flow"]
+            if ctx["amps"] is not None:
+                sim_sm["motorAmps"] = ctx["amps"]
+
+            latest_ts = base_m.recorded_at if base_m and base_m.recorded_at else datetime.now(timezone.utc)
+            if latest_ts.tzinfo is None:
+                latest_ts = latest_ts.replace(tzinfo=timezone.utc)
+            sim_ts = max(datetime.now(timezone.utc), latest_ts + timedelta(seconds=1))
+
+            mock_metric = SimpleNamespace(
+                id=uuid.uuid4(),
+                equipment_id=eq.id,
+                temperature_celsius=ctx["temp"],
+                vibration_mm_s=ctx["vib"],
+                operating_hours=float(base_m.operating_hours) if base_m and base_m.operating_hours is not None else round((eq.usage_time or 0) / 60.0, 2),
+                specific_metrics=sim_sm,
+                notes="Escenario Simulado What-If",
+                recorded_at=sim_ts,
+            )
+            eval_list = [mock_metric, *ctx["metricas_recientes"]]
+            sim_ml = evaluar_metrica_actual_ml(eq, eval_list, ctx["ultimas_fallas"], ctx["ultimos_mantenimientos"])
+            sim_anom = _evaluar_anomalias_nodo(eq, mock_metric, sim_ml, operational_status_override=ctx["op_status"])
+            for cnote in ctx["cascade_notes"]:
+                if cnote not in sim_anom:
+                    sim_anom.append(cnote)
+
+            sim_prob = float(sim_ml.get("probabilidad_falla") or 0.0)
+            sim_health, sim_status = _evaluar_salud_y_estado_nodo(eq, mock_metric, sim_prob, sim_anom, True, operational_status_override=ctx["op_status"])
+            latest_payload, recent_series = _formatear_metricas_nodo(mock_metric, base_m, ctx["metricas_recientes"])
+            has_telemetry_out = True
+            impacted_count += 1
+        else:
+            sim_ml = (
+                evaluar_metrica_actual_ml(eq, ctx["metricas_recientes"], ctx["ultimas_fallas"], ctx["ultimos_mantenimientos"])
+                if ctx["has_real"]
+                else {"probabilidad_falla": 0.0, "clasificacion_alerta": "SIN TELEMETRIA", "salto_amperaje": 0.0, "dias_ultima_falla": None, "dias_ultimo_mantenimiento": None}
+            )
+            sim_anom = _evaluar_anomalias_nodo(eq, ctx["m_actual"], sim_ml)
+            sim_prob = ctx["base_prob"]
+            sim_health = ctx["base_health"]
+            sim_status = ctx["base_status"]
+            latest_payload, recent_series = _formatear_metricas_nodo(
+                ctx["m_actual"],
+                ctx["metricas_recientes"][1] if len(ctx["metricas_recientes"]) > 1 else None,
+                ctx["metricas_recientes"],
+            )
+            has_telemetry_out = ctx["has_real"]
+
+        crit = crit_map.get(eq.id)
+        tax = tax_map.get(eq.taxonomy_id)
+        actuators_out = dict(ctx["scada_actuators"])
+        actuators_out["valve_open_pct"] = ctx["valve_pct"]
+
+        sim_nodes.append({
+            "id": eid,
+            "tag_number": eq.tag_number,
+            "name": eq.name,
+            "brand": eq.brand,
+            "model": eq.model,
+            "equipment_type": eq.equipment_type,
+            "family": ctx["family"],
+            "operational_status": ctx["op_status"],
+            "usage_time": eq.usage_time,
+            "taxonomy_id": str(eq.taxonomy_id) if eq.taxonomy_id else None,
+            "taxonomy_name": tax.name if tax else "Planta General",
+            "stage": ctx["stage"],
+            "pid_position": ctx["pid_position"],
+            "pid_connections": ctx["pid_connections"],
+            "scada_actuators": actuators_out,
+            "criticality_level": crit.criticality_level if crit else None,
+            "rpn_score": crit.rpn_score if crit else None,
+            "has_telemetry": has_telemetry_out,
+            "latest_metric": latest_payload,
+            "recent_series": recent_series,
+            "ml_prediction": sim_ml,
+            "health_score": sim_health,
+            "status": sim_status,
+            "anomalies": sim_anom,
+            "active_work_orders_count": active_wo_count_map.get(eq.id, 0),
+            "latest_recommendation": None,
+            "technical_specifications": eq.technical_specifications or {},
+            "is_overridden": ctx["is_overridden"],
+            "is_cascade_impacted": ctx["is_cascade"],
+            "baseline_health": ctx["base_health"],
+            "delta_health": sim_health - ctx["base_health"],
+            "baseline_risk_pct": round(ctx["base_prob"] * 100, 1),
+            "delta_risk_pct": round((sim_prob - ctx["base_prob"]) * 100, 1),
+        })
+
+    base_avg = round(sum(n["baseline_health"] for n in sim_nodes) / len(sim_nodes), 1) if sim_nodes else 100.0
+    sim_avg = round(sum(n["health_score"] for n in sim_nodes) / len(sim_nodes), 1) if sim_nodes else 100.0
+
+    return {
+        "simulated_at": datetime.now(timezone.utc).isoformat(),
+        "non_destructive": True,
+        "impacted_count": impacted_count,
+        "baseline_summary": {
+            "average_health_score": base_avg,
+            "critical_count": sum(1 for eid in ordered_eids if node_ctx[eid]["base_status"] == "critical"),
+        },
+        "simulated_summary": {
+            "average_health_score": sim_avg,
+            "delta_health_score": round(sim_avg - base_avg, 1),
+            "critical_count": sum(1 for n in sim_nodes if n["status"] == "critical"),
+            "warning_count": sum(1 for n in sim_nodes if n["status"] == "warning"),
+        },
+        "nodes": sim_nodes,
+    }
+
+
+def _is_safe_external_webhook(url_str: str) -> bool:
+    try:
+        parsed = urlparse(url_str)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False
+        host = parsed.hostname.lower().strip()
+        if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+            return False
+        try:
+            ip_obj = ipaddress.ip_address(host)
+            if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_reserved or ip_obj.is_multicast:
+                return False
+        except ValueError:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+async def aplicar_consigna_scada_equipo(
+    db: AsyncSession,
+    equipment_id: uuid.UUID,
+    consigna: dict,
+    current_user: User,
+) -> dict:
+    """Guarda consignas operativas SCADA y opcionalmente reenvía comando al gateway Edge."""
+    eq = (
+        await db.execute(select(Equipment).where(Equipment.id == equipment_id, Equipment.deleted_at.is_(None)))
+    ).scalar_one_or_none()
+    if not eq:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Equipo no encontrado.")
+
+    specs = dict(eq.technical_specifications or {}) if isinstance(eq.technical_specifications, dict) else {}
+    actuators = dict(specs.get("scada_actuators") or {}) if isinstance(specs.get("scada_actuators"), dict) else {}
+
+    if consigna.get("valve_open_pct") is not None:
+        valve_pct = max(0.0, min(100.0, float(consigna["valve_open_pct"])))
+        actuators["valve_open_pct"] = valve_pct
+        if isinstance(specs.get("pid_connections"), list):
+            for conn in specs["pid_connections"]:
+                if isinstance(conn, dict):
+                    conn["valve_open_pct"] = valve_pct
+
+    if "rpm_setpoint" in consigna:
+        actuators["rpm_setpoint"] = consigna["rpm_setpoint"]
+    if "pressure_setpoint_psi" in consigna:
+        actuators["pressure_setpoint_psi"] = consigna["pressure_setpoint_psi"]
+    if consigna.get("mode") in ("AUTO", "MANUAL"):
+        actuators["mode"] = consigna["mode"]
+    if "edge_webhook_url" in consigna:
+        webhook_val = (consigna["edge_webhook_url"] or "").strip() or None
+        if webhook_val and not _is_safe_external_webhook(webhook_val):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="La URL de pasarela Edge no es válida o apunta a una red restringida.")
+        actuators["edge_webhook_url"] = webhook_val
+
+    actuators["updated_at"] = datetime.now(timezone.utc).isoformat()
+    actuators["updated_by"] = current_user.email
+    specs["scada_actuators"] = actuators
+
+    eq.technical_specifications = specs
+    eq.updated_by = current_user.id
+    flag_modified(eq, "technical_specifications")
+    await db.commit()
+
+    webhook_dispatch = {"attempted": False, "status_code": None, "error": None}
+    target_webhook = actuators.get("edge_webhook_url")
+    if target_webhook and _is_safe_external_webhook(target_webhook):
+        webhook_dispatch["attempted"] = True
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client_http:
+                resp = await client_http.post(
+                    target_webhook,
+                    json={
+                        "equipment_id": str(eq.id),
+                        "tag_number": eq.tag_number,
+                        "setpoints": actuators,
+                        "issued_by": current_user.email,
+                    },
+                )
+                webhook_dispatch["status_code"] = resp.status_code
+        except Exception as hook_err:
+            webhook_dispatch["error"] = str(hook_err)
+
+    await twin_hub.broadcast_event(
+        "setpoint_updated",
+        {
+            "equipment_id": str(eq.id),
+            "tag_number": eq.tag_number,
+            "actuators": actuators,
+        },
+        taxonomy_id=str(eq.taxonomy_id) if eq.taxonomy_id else None,
+    )
+
+    return {
+        "equipment_id": str(eq.id),
+        "tag_number": eq.tag_number,
+        "scada_actuators": actuators,
+        "webhook_dispatch": webhook_dispatch,
     }

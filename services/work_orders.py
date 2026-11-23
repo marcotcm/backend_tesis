@@ -14,6 +14,7 @@ from schemas.work_orders import WorkOrderCreate, WorkOrderUpdate
 from models.work_orders import WorkOrder, WorkOrderStatus
 from models.user import User, UserRole
 from services.notification import notify_work_order_assignment
+from services.realtime_twin_hub import twin_hub
 
 async def create_new_work_order(db: AsyncSession, wo_in: WorkOrderCreate, current_user: User) -> WorkOrder:
     """Emite una nueva orden de trabajo, vinculándola criptográficamente al planificador en sesión."""
@@ -31,6 +32,8 @@ async def create_new_work_order(db: AsyncSession, wo_in: WorkOrderCreate, curren
                 title="🛠️ Nueva Orden de Trabajo Asignada",
                 message=f"Se te ha asignado una nueva OT ({wo.id}) para ejecución en campo."
             )
+
+        await twin_hub.broadcast_event("work_order_updated", {"work_order_id": str(wo.id), "status": wo.status})
             
         return wo
     except Exception as e:
@@ -94,6 +97,7 @@ async def update_work_order_record(
         except Exception as notif_err:
             print(f"[WARN NOTIF OT UPDATE] No se pudo notificar asignación: {notif_err}")
 
+    await twin_hub.broadcast_event("work_order_updated", {"work_order_id": str(updated_wo.id), "status": updated_wo.status})
     return updated_wo
 
 async def cancel_work_order(db: AsyncSession, wo_id: uuid.UUID, current_user: User) -> dict:
@@ -116,5 +120,6 @@ async def cancel_work_order(db: AsyncSession, wo_id: uuid.UUID, current_user: Us
         )
         
     await crud_wo.update_work_order(db, db_obj=db_wo, update_data={"status": WorkOrderStatus.cancelado})
+    await twin_hub.broadcast_event("work_order_updated", {"work_order_id": str(wo_id), "status": WorkOrderStatus.cancelado})
     
     return {"detail": "Orden de trabajo cancelada satisfactoriamente (Baja lógica)."}

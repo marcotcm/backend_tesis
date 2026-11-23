@@ -20,6 +20,56 @@ from models.user import User, UserRole
 from schemas.equipment_metrics import EquipmentMetricCreate, EquipmentMetricUpdate
 from services.ai_predictive_service import ejecutar_analisis_predictivo_background
 from services.notification import trigger_global_alert
+from services.realtime_twin_hub import twin_hub
+
+
+def _exceeds_equipment_thresholds(
+    equipment: Optional[Equipment],
+    temperature_celsius: Optional[float],
+    vibration_mm_s: Optional[float],
+    specific_metrics: Optional[dict],
+) -> bool:
+    """Evalúa si la lectura supera límites de `standard_metric` o zona crítica ISO 10816."""
+    if vibration_mm_s is not None and vibration_mm_s >= 7.1:
+        return True
+    if not equipment or not isinstance(equipment.technical_specifications, dict):
+        return False
+
+    standard_metric = equipment.technical_specifications.get("standard_metric", {})
+    if not isinstance(standard_metric, dict):
+        return False
+
+    if "temperature_celsius" in standard_metric and temperature_celsius is not None:
+        t_limits = standard_metric["temperature_celsius"]
+        if isinstance(t_limits, dict):
+            t_min = t_limits.get("min", -50)
+            t_max = t_limits.get("max", 1000)
+            if temperature_celsius < t_min or temperature_celsius > t_max:
+                return True
+
+    if "vibration_mm_s" in standard_metric and vibration_mm_s is not None:
+        v_limits = standard_metric["vibration_mm_s"]
+        if isinstance(v_limits, dict):
+            v_min = v_limits.get("min", 0)
+            v_max = v_limits.get("max", 100)
+            if vibration_mm_s < v_min or vibration_mm_s > v_max:
+                return True
+
+    if isinstance(specific_metrics, dict):
+        for var_name, valor_actual in specific_metrics.items():
+            if var_name in standard_metric and isinstance(standard_metric[var_name], dict) and valor_actual is not None:
+                s_min = standard_metric[var_name].get("min")
+                s_max = standard_metric[var_name].get("max")
+                try:
+                    num_val = float(valor_actual)
+                except (ValueError, TypeError):
+                    continue
+                if s_min is not None and num_val < float(s_min):
+                    return True
+                if s_max is not None and num_val > float(s_max):
+                    return True
+
+    return False
 
 
 async def record_metric(
@@ -45,65 +95,36 @@ async def record_metric(
         )
         equipment = eq_result.scalar_one_or_none()
 
-        if equipment and equipment.technical_specifications:
-            specs = equipment.technical_specifications
-            standard_metric = specs.get("standard_metric", {})
+        # 3. Si se supera algún estándar, lanzar alerta y encolar el análisis con sesión propia
+        if _exceeds_equipment_thresholds(
+            equipment=equipment,
+            temperature_celsius=metric_in.temperature_celsius,
+            vibration_mm_s=metric_in.vibration_mm_s,
+            specific_metrics=metric_in.specific_metrics,
+        ):
+            await trigger_global_alert(
+                db=db,
+                title="⚠️ Alerta: Métrica Anómala Detectada",
+                message=f"El equipo {(equipment.tag_number if equipment else None) or metric_in.equipment_id} registró valores fuera de rango operativo normal. Iniciando análisis predictivo IA.",
+            )
+            await db.commit()
 
-            disparar_ia = False
+            background_tasks.add_task(
+                ejecutar_analisis_predictivo_background,
+                equipment_id=metric_in.equipment_id,
+                trigger_source="Anomalía en Métrica en Tiempo Real",
+                trigger_reference_id=nueva_metrica.id,
+            )
 
-            # Validación de Temperatura
-            if (
-                "temperature_celsius" in standard_metric
-                and metric_in.temperature_celsius is not None
-            ):
-                t_min = standard_metric["temperature_celsius"].get("min", -50)
-                t_max = standard_metric["temperature_celsius"].get("max", 1000)
-                if (
-                    metric_in.temperature_celsius < t_min
-                    or metric_in.temperature_celsius > t_max
-                ):
-                    disparar_ia = True
-
-            # Validación de Vibración
-            if (
-                "vibration_mm_s" in standard_metric
-                and metric_in.vibration_mm_s is not None
-            ):
-                v_min = standard_metric["vibration_mm_s"].get("min", 0)
-                v_max = standard_metric["vibration_mm_s"].get("max", 100)
-                if (
-                    metric_in.vibration_mm_s < v_min
-                    or metric_in.vibration_mm_s > v_max
-                ):
-                    disparar_ia = True
-
-            # Validación dinámica para otras variables dentro de 'specific_metrics'
-            if metric_in.specific_metrics:
-                for var_name, valor_actual in metric_in.specific_metrics.items():
-                    if var_name in standard_metric and valor_actual is not None:
-                        s_min = standard_metric[var_name].get("min")
-                        s_max = standard_metric[var_name].get("max")
-                        if s_min is not None and valor_actual < s_min:
-                            disparar_ia = True
-                        if s_max is not None and valor_actual > s_max:
-                            disparar_ia = True
-
-            # 3. Si se supera algún estándar, lanzar alerta y encolar el análisis con sesión propia
-            if disparar_ia:
-                await trigger_global_alert(
-                    db=db,
-                    title="⚠️ Alerta: Métrica Anómala Detectada",
-                    message=f"El equipo {equipment.tag_number or metric_in.equipment_id} registró valores fuera de rango operativo normal. Iniciando análisis predictivo IA."
-                )
-                # Confirmar la métrica y la alerta antes de que inicie la tarea en segundo plano
-                await db.commit()
-
-                background_tasks.add_task(
-                    ejecutar_analisis_predictivo_background,
-                    equipment_id=metric_in.equipment_id,
-                    trigger_source="Anomalía en Métrica en Tiempo Real",
-                    trigger_reference_id=nueva_metrica.id,
-                )
+        await twin_hub.broadcast_event(
+            "metric_ingested",
+            {
+                "equipment_id": str(metric_in.equipment_id),
+                "tag_number": equipment.tag_number if equipment else None,
+                "metric_id": str(nueva_metrica.id),
+            },
+            taxonomy_id=str(equipment.taxonomy_id) if equipment and equipment.taxonomy_id else None,
+        )
 
         return nueva_metrica
 
@@ -114,6 +135,117 @@ async def record_metric(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Fallo al registrar la métrica en la base de datos: {str(e)}",
         )
+
+
+async def ingest_iot_batch(
+    db: AsyncSession,
+    source: str,
+    readings: List[dict],
+    actor_user_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """
+    Ingesta industrial de alta frecuencia referenciada por TAG de planta (o UUID).
+    Inserta el lote en `equipment_metrics_history` y transmite actualización WebSocket <100ms.
+    """
+    eq_rows = (
+        await db.execute(
+            select(Equipment).where(Equipment.is_active == True, Equipment.deleted_at.is_(None))
+        )
+    ).scalars().all()
+
+    by_id = {eq.id: eq for eq in eq_rows}
+    by_tag = {str(eq.tag_number or "").strip().upper(): eq for eq in eq_rows if eq.tag_number}
+
+    created_objs: List[EquipmentMetricHistory] = []
+    matched_eqs: List[Equipment] = []
+    unmatched_tags: List[str] = []
+
+    for item in readings:
+        eq = None
+        if item.get("equipment_id"):
+            eq = by_id.get(item["equipment_id"])
+        if not eq and item.get("tag_number"):
+            tag_key = str(item["tag_number"]).strip().upper()
+            eq = by_tag.get(tag_key)
+
+        if not eq:
+            unmatched_tags.append(str(item.get("tag_number") or item.get("equipment_id") or "DESCONOCIDO"))
+            continue
+
+        spec = dict(item.get("specific_metrics") or {})
+        if item.get("pressure_psi") is not None:
+            spec["presion_descarga_psi"] = float(item["pressure_psi"])
+        if item.get("flow_rate_bpd") is not None:
+            spec["caudal_bpd"] = float(item["flow_rate_bpd"])
+        if item.get("motor_amps") is not None:
+            spec["motorAmps"] = float(item["motor_amps"])
+        if item.get("liquid_level_pct") is not None:
+            spec["liquid_level_percentage"] = float(item["liquid_level_pct"])
+        if item.get("rpm") is not None:
+            spec["velocidad_rpm"] = float(item["rpm"])
+
+        op_hours = item.get("operating_hours")
+        if op_hours is None:
+            op_hours = round(float(eq.usage_time or 0) / 60.0, 2)
+
+        metric_obj = EquipmentMetricHistory(
+            equipment_id=eq.id,
+            temperature_celsius=item.get("temperature_celsius"),
+            vibration_mm_s=item.get("vibration_mm_s"),
+            operating_hours=op_hours,
+            specific_metrics=spec,
+            notes=item.get("notes") or f"Telemetría IoT ({source})",
+            recorded_by=actor_user_id,
+        )
+        created_objs.append(metric_obj)
+        matched_eqs.append(eq)
+
+    if not created_objs:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Ningún TAG coincide con equipos activos en planta ({', '.join(unmatched_tags[:5])}).",
+        )
+
+    db.add_all(created_objs)
+    await db.commit()
+
+    anomalous_eq_ids: set[uuid.UUID] = set()
+    for eq, metric_obj in zip(matched_eqs, created_objs):
+        await db.refresh(metric_obj)
+        if eq.id not in anomalous_eq_ids and _exceeds_equipment_thresholds(
+            equipment=eq,
+            temperature_celsius=float(metric_obj.temperature_celsius) if metric_obj.temperature_celsius is not None else None,
+            vibration_mm_s=float(metric_obj.vibration_mm_s) if metric_obj.vibration_mm_s is not None else None,
+            specific_metrics=metric_obj.specific_metrics,
+        ):
+            anomalous_eq_ids.add(eq.id)
+            background_tasks.add_task(
+                ejecutar_analisis_predictivo_background,
+                equipment_id=eq.id,
+                trigger_source=f"IoT Gateway ({source})",
+                trigger_reference_id=metric_obj.id,
+            )
+
+    tags_updated = list({eq.tag_number for eq in matched_eqs})
+    equipment_ids = list({str(eq.id) for eq in matched_eqs})
+
+    await twin_hub.broadcast_event(
+        "iot_batch_ingested",
+        {
+            "source": source,
+            "ingested_count": len(created_objs),
+            "tags": tags_updated,
+            "equipment_ids": equipment_ids,
+        },
+    )
+
+    return {
+        "source": source,
+        "ingested_count": len(created_objs),
+        "unmatched_tags": unmatched_tags,
+        "tags_updated": tags_updated,
+    }
 
 
 # ==========================================

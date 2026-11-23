@@ -6,18 +6,121 @@ gestionando la interacción con la base de datos local para la telemetría de eq
 """
 
 import uuid
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Security, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.config import settings
+from core.security import get_current_user, RoleChecker, verify_supabase_token
+from crud.user import get_user_by_id
 from db.session import get_db
-from core.security import get_current_user, RoleChecker
 from models.user import User, UserRole
 from schemas.equipment_metrics import EquipmentMetricCreate, EquipmentMetricUpdate, EquipmentMetricResponse
 from services import equipment_metrics as metrics_service
 
 router = APIRouter()
+optional_bearer = HTTPBearer(auto_error=False)
+
+
+class IoTReadingItem(BaseModel):
+    tag_number: Optional[str] = None
+    equipment_id: Optional[uuid.UUID] = None
+    temperature_celsius: Optional[float] = None
+    vibration_mm_s: Optional[float] = None
+    operating_hours: Optional[float] = None
+    pressure_psi: Optional[float] = None
+    flow_rate_bpd: Optional[float] = None
+    motor_amps: Optional[float] = None
+    liquid_level_pct: Optional[float] = None
+    rpm: Optional[float] = None
+    specific_metrics: Optional[Dict[str, Any]] = None
+    notes: Optional[str] = None
+
+    @field_validator("temperature_celsius")
+    @classmethod
+    def check_temp(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and (v < -50 or v > 1000):
+            raise ValueError("La temperatura debe estar entre -50°C y 1000°C.")
+        return v
+
+    @field_validator("vibration_mm_s")
+    @classmethod
+    def check_vib(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and v < 0:
+            raise ValueError("La vibración no puede ser negativa.")
+        return v
+
+
+class IoTBatchIngestRequest(BaseModel):
+    source: str = Field(default="edge-gateway", min_length=1, max_length=100)
+    readings: List[IoTReadingItem] = Field(..., min_length=1, max_length=200)
+
+
+async def _resolve_iot_actor_user_id(
+    db: AsyncSession,
+    credentials: Optional[HTTPAuthorizationCredentials],
+    x_iot_key: Optional[str],
+) -> uuid.UUID:
+    # 1. Machine-to-Machine X-IoT-Key cuando IOT_INGEST_API_KEY está configurado
+    if settings.IOT_INGEST_API_KEY and x_iot_key and x_iot_key == settings.IOT_INGEST_API_KEY:
+        stmt = (
+            select(User.id)
+            .where(User.is_active == True)
+            .order_by((User.role == UserRole.admin).desc())
+            .limit(1)
+        )
+        actor_id = (await db.execute(stmt)).scalar_one_or_none()
+        if not actor_id:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="No existe un usuario activo de servicio para registrar telemetría IoT.",
+            )
+        return actor_id
+
+    # 2. Sesión Bearer JWT estándar
+    if credentials and credentials.credentials:
+        token_payload = verify_supabase_token(credentials)
+        user_id_str = token_payload.get("sub")
+        if user_id_str:
+            try:
+                user_uuid = uuid.UUID(user_id_str)
+            except ValueError:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="UUID de usuario inválido en token.")
+            user = await get_user_by_id(db, user_id=user_uuid)
+            if user and user.is_active:
+                return user.id
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Se requiere Bearer JWT válido o cabecera X-IoT-Key autorizada para ingesta IoT.",
+    )
+
+
+@router.post("/iot-ingest", status_code=status.HTTP_201_CREATED, summary="Ingesta Industrial IoT en Lote por TAG")
+async def ingestar_telemetria_iot(
+    payload: IoTBatchIngestRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(optional_bearer),
+    x_iot_key: Optional[str] = Header(None, alias="X-IoT-Key"),
+):
+    """
+    Endpoint de alta frecuencia para pasarelas PLC / OPC-UA / Modbus / Node-RED / MQTT.
+    Acepta hasta 200 lecturas por llamada referenciadas por TAG de planta y emite eventos
+    instantáneos por WebSocket hacia la Sala de Control SCADA.
+    """
+    actor_user_id = await _resolve_iot_actor_user_id(db, credentials, x_iot_key)
+    return await metrics_service.ingest_iot_batch(
+        db=db,
+        source=payload.source,
+        readings=[r.model_dump() for r in payload.readings],
+        actor_user_id=actor_user_id,
+        background_tasks=background_tasks,
+    )
 
 @router.post("/", response_model=EquipmentMetricResponse, status_code=status.HTTP_201_CREATED)
 async def registrar_metrica(
