@@ -32,6 +32,9 @@ from models.maintenance_history import MaintenanceHistory
 from models.equipment_criticality import EquipmentCriticality
 from models.ai_recommendation import AIRecommendation
 from models.ai_correction import AICorrection
+from models.equipment_taxonomy import EquipmentTaxonomy
+from models.maintenance import Maintenance
+from models.work_orders import WorkOrder
 from crud import ai_recommendation as crud_recommendation
 from services.notification import notify_ai_analysis_ready
 from dotenv import load_dotenv
@@ -1367,4 +1370,306 @@ async def generar_planes_mantenimiento_globales(db: AsyncSession, trigger_source
         "planes_creados": len(planes_generados),
         "errores": errores,
         "detalle_planes": planes_generados
+    }
+
+
+# =====================================================================
+# ENDPOINT INTERNO 5: ESTADO EN TIEMPO REAL DEL GEMELO DIGITAL P&ID
+# =====================================================================
+def _resolver_etapa_pid(equipment: Equipment) -> str:
+    specs = equipment.technical_specifications if isinstance(equipment.technical_specifications, dict) else {}
+    pid_stage = str(specs.get("pid_stage") or "").strip().lower()
+    if pid_stage in ("upstream", "central", "downstream"):
+        return pid_stage
+
+    cat = identificar_categoria_equipo(equipment)
+    if cat["is_tanque"]:
+        return "central"
+    if cat["is_compresor"]:
+        return "downstream"
+
+    haystack = f"{equipment.tag_number or ''} {equipment.name or ''} {specs.get('_subtype', '')} {specs.get('subtype', '')}".lower()
+    if any(k in haystack for k in ("centrifug", "transfer", "despacho", "booster", "oleoducto", "pump_centrifugal")):
+        return "downstream"
+    return "upstream"
+
+
+def _evaluar_anomalias_nodo(
+    equipment: Equipment,
+    metrica_actual: Optional[EquipmentMetricHistory],
+    resultado_ml: dict
+) -> List[str]:
+    anomalias: List[str] = []
+    op_status = (equipment.operational_status or "").strip().lower()
+    if op_status in ("failed", "falla", "critical", "out_of_service"):
+        anomalias.append(f"Estado operativo en PostgreSQL: {op_status.upper()}.")
+    elif op_status in ("under_maintenance", "maintenance"):
+        anomalias.append("Equipo en intervención de mantenimiento programada.")
+
+    if not metrica_actual:
+        return anomalias
+
+    specs = equipment.technical_specifications if isinstance(equipment.technical_specifications, dict) else {}
+    std = specs.get("standard_metric") if isinstance(specs.get("standard_metric"), dict) else {}
+
+    if metrica_actual.temperature_celsius is not None:
+        t = float(metrica_actual.temperature_celsius)
+        t_bounds = std.get("temperature_celsius") if isinstance(std.get("temperature_celsius"), dict) else {}
+        t_min = _safe_float(t_bounds.get("min"), -50.0)
+        t_max = _safe_float(t_bounds.get("max"), 95.0 if identificar_categoria_equipo(equipment)["is_compresor"] else (48.0 if identificar_categoria_equipo(equipment)["is_tanque"] else 80.0))
+        if t > t_max or t < t_min:
+            anomalias.append(f"Temperatura ({t:.1f} °C) fuera de estándar ({t_min}–{t_max} °C).")
+
+    if metrica_actual.vibration_mm_s is not None:
+        v = float(metrica_actual.vibration_mm_s)
+        v_bounds = std.get("vibration_mm_s") if isinstance(std.get("vibration_mm_s"), dict) else {}
+        v_max = _safe_float(v_bounds.get("max"), 4.5)
+        if v >= 7.1:
+            anomalias.append(f"Vibración RMS ({v:.2f} mm/s) en Zona D Crítica ISO 10816-3 (>= 7.1 mm/s).")
+        elif v > v_max or v >= 4.5:
+            anomalias.append(f"Vibración RMS ({v:.2f} mm/s) supera umbral operativo ({v_max} mm/s).")
+
+    if isinstance(metrica_actual.specific_metrics, dict):
+        for var_name, valor_actual in metrica_actual.specific_metrics.items():
+            if var_name in std and isinstance(std[var_name], dict):
+                val_num = _safe_float(valor_actual, None)
+                if val_num is not None:
+                    s_min = std[var_name].get("min")
+                    s_max = std[var_name].get("max")
+                    if s_min is not None and val_num < _safe_float(s_min):
+                        anomalias.append(f"{var_name} ({val_num}) por debajo del mínimo ({s_min}).")
+                    if s_max is not None and val_num > _safe_float(s_max):
+                        anomalias.append(f"{var_name} ({val_num}) supera el máximo ({s_max}).")
+
+    prob_ml = float(resultado_ml.get("probabilidad_falla") or 0.0)
+    if prob_ml >= 0.70:
+        anomalias.append(f"Modelo XGBoost detecta riesgo crítico de falla <48h ({round(prob_ml * 100, 1)}%).")
+    elif prob_ml >= 0.40:
+        anomalias.append(f"Modelo XGBoost detecta riesgo moderado de falla ({round(prob_ml * 100, 1)}%).")
+
+    return anomalias
+
+
+async def obtener_estado_gemelo_digital(
+    db: AsyncSession,
+    taxonomy_id: Optional[uuid.UUID] = None
+) -> dict:
+    """
+    Construye el estado completo en tiempo real del Gemelo Digital P&ID usando
+    100% datos reales de PostgreSQL y evaluando cada equipo con XGBoost.
+    """
+    eq_stmt = select(Equipment).where(Equipment.is_active == True, Equipment.deleted_at.is_(None))
+    if taxonomy_id is not None:
+        eq_stmt = eq_stmt.where(Equipment.taxonomy_id == taxonomy_id)
+    eq_stmt = eq_stmt.order_by(Equipment.tag_number.asc(), Equipment.name.asc())
+    equipos_activos = (await db.execute(eq_stmt)).scalars().all()
+
+    taxonomies_rows = (await db.execute(
+        select(EquipmentTaxonomy).where(EquipmentTaxonomy.deleted_at.is_(None)).order_by(EquipmentTaxonomy.name.asc())
+    )).scalars().all()
+    tax_map = {t.id: t for t in taxonomies_rows}
+
+    crit_rows = (await db.execute(select(EquipmentCriticality))).scalars().all()
+    crit_map = {c.equipment_id: c for c in crit_rows}
+
+    wo_rows = (await db.execute(
+        select(Maintenance.equipment_id, WorkOrder.status)
+        .join(Maintenance, Maintenance.id == WorkOrder.maintenance_id)
+        .where(WorkOrder.status.in_(["Pendiente", "En Proceso", "pending", "in_progress"]))
+    )).all()
+    active_wo_count_map: dict[uuid.UUID, int] = {}
+    for eq_id_row, _ in wo_rows:
+        active_wo_count_map[eq_id_row] = active_wo_count_map.get(eq_id_row, 0) + 1
+
+    nodos = []
+    for eq in equipos_activos:
+        metricas_recientes = (await db.execute(
+            select(EquipmentMetricHistory)
+            .where(EquipmentMetricHistory.equipment_id == eq.id)
+            .order_by(EquipmentMetricHistory.recorded_at.desc())
+            .limit(15)
+        )).scalars().all()
+
+        ultimas_fallas = (await db.execute(
+            select(FailureHistory)
+            .where(FailureHistory.equipment_id == eq.id)
+            .order_by(FailureHistory.failure_date.desc())
+            .limit(5)
+        )).scalars().all()
+
+        ultimos_mantenimientos = (await db.execute(
+            select(MaintenanceHistory)
+            .where(MaintenanceHistory.equipment_id == eq.id)
+            .order_by(MaintenanceHistory.execution_date.desc())
+            .limit(5)
+        )).scalars().all()
+
+        ultima_rec = (await db.execute(
+            select(AIRecommendation)
+            .where(AIRecommendation.equipment_id == eq.id)
+            .order_by(AIRecommendation.created_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+
+        has_telemetry = len(metricas_recientes) > 0
+        metrica_actual = metricas_recientes[0] if has_telemetry else None
+        metrica_previa = metricas_recientes[1] if len(metricas_recientes) > 1 else None
+
+        if has_telemetry:
+            resultado_ml = evaluar_metrica_actual_ml(
+                equipment=eq,
+                metricas_orm=metricas_recientes,
+                ultimas_fallas=ultimas_fallas,
+                ultimos_mantenimientos=ultimos_mantenimientos
+            )
+        else:
+            resultado_ml = {
+                "probabilidad_falla": 0.0,
+                "clasificacion_alerta": "SIN TELEMETRIA",
+                "salto_amperaje": 0.0,
+                "dias_ultima_falla": None,
+                "dias_ultimo_mantenimiento": None,
+            }
+
+        anomalias = _evaluar_anomalias_nodo(eq, metrica_actual, resultado_ml)
+        anomalia_fisica = _tiene_anomalia_fisica_directa(eq, metrica_actual)
+        prob_ml = float(resultado_ml.get("probabilidad_falla") or 0.0)
+        op_lower = (eq.operational_status or "operational").strip().lower()
+
+        # Cálculo de salud real del nodo combinando XGBoost, estado operativo y desviación física
+        if op_lower in ("failed", "critical", "falla", "out_of_service"):
+            health_score = max(10, round(min(40.0, 100.0 - prob_ml * 85.0)))
+        elif has_telemetry:
+            base_health = 100.0 - (prob_ml * 62.0)
+            if anomalia_fisica:
+                base_health -= 22.0
+            if op_lower in ("under_maintenance", "maintenance"):
+                base_health = min(base_health, 75.0)
+            health_score = max(5, min(100, round(base_health)))
+        else:
+            health_score = 68 if op_lower in ("under_maintenance", "maintenance") else (85 if op_lower == "standby" else 100)
+
+        if op_lower in ("failed", "critical", "falla", "out_of_service") or prob_ml >= 0.70 or health_score < 55:
+            node_status = "critical"
+        elif op_lower in ("under_maintenance", "maintenance") or prob_ml >= 0.40 or len(anomalias) > 0 or health_score < 80:
+            node_status = "warning"
+        else:
+            node_status = "normal"
+
+        latest_metric_payload = None
+        if metrica_actual:
+            sm = metrica_actual.specific_metrics if isinstance(metrica_actual.specific_metrics, dict) else {}
+            pressure_val = sm.get("presion_descarga_psi", sm.get("pressure_psi", sm.get("internal_pressure_psi", sm.get("thpPsi"))))
+            flow_val = sm.get("caudal_bpd", sm.get("flow_rate_bpd", sm.get("flowRateBpd", sm.get("caudal_mmscfd"))))
+            amps_val = sm.get("motorAmps", sm.get("current_amps"))
+            level_val = sm.get("liquid_level_percentage", sm.get("level_percent"))
+
+            delta_vib = (
+                round(float(metrica_actual.vibration_mm_s) - float(metrica_previa.vibration_mm_s), 2)
+                if metrica_previa and metrica_actual.vibration_mm_s is not None and metrica_previa.vibration_mm_s is not None
+                else None
+            )
+            delta_temp = (
+                round(float(metrica_actual.temperature_celsius) - float(metrica_previa.temperature_celsius), 1)
+                if metrica_previa and metrica_actual.temperature_celsius is not None and metrica_previa.temperature_celsius is not None
+                else None
+            )
+
+            latest_metric_payload = {
+                "id": str(metrica_actual.id),
+                "temperature_celsius": float(metrica_actual.temperature_celsius) if metrica_actual.temperature_celsius is not None else None,
+                "vibration_mm_s": float(metrica_actual.vibration_mm_s) if metrica_actual.vibration_mm_s is not None else None,
+                "operating_hours": float(metrica_actual.operating_hours) if metrica_actual.operating_hours is not None else None,
+                "pressure_psi": _safe_float(pressure_val, None) if pressure_val is not None else None,
+                "flow_rate": _safe_float(flow_val, None) if flow_val is not None else None,
+                "motor_amps": _safe_float(amps_val, None) if amps_val is not None else None,
+                "liquid_level_pct": _safe_float(level_val, None) if level_val is not None else None,
+                "specific_metrics": sm,
+                "notes": metrica_actual.notes,
+                "recorded_at": metrica_actual.recorded_at.isoformat() if metrica_actual.recorded_at else None,
+                "delta_vib": delta_vib,
+                "delta_temp": delta_temp,
+            }
+
+        recent_series = []
+        for m in reversed(metricas_recientes[:10]):
+            m_sm = m.specific_metrics if isinstance(m.specific_metrics, dict) else {}
+            m_press = m_sm.get("presion_descarga_psi", m_sm.get("pressure_psi", m_sm.get("internal_pressure_psi")))
+            recent_series.append({
+                "recorded_at": m.recorded_at.isoformat() if m.recorded_at else None,
+                "vibration_mm_s": float(m.vibration_mm_s) if m.vibration_mm_s is not None else None,
+                "temperature_celsius": float(m.temperature_celsius) if m.temperature_celsius is not None else None,
+                "pressure_psi": _safe_float(m_press, None) if m_press is not None else None,
+            })
+
+        crit = crit_map.get(eq.id)
+        tax = tax_map.get(eq.taxonomy_id)
+        cat_flags = identificar_categoria_equipo(eq)
+        family = "tank" if cat_flags["is_tanque"] else ("compressor" if cat_flags["is_compresor"] else "pump")
+
+        nodos.append({
+            "id": str(eq.id),
+            "tag_number": eq.tag_number,
+            "name": eq.name,
+            "brand": eq.brand,
+            "model": eq.model,
+            "equipment_type": eq.equipment_type,
+            "family": family,
+            "operational_status": eq.operational_status,
+            "usage_time": eq.usage_time,
+            "taxonomy_id": str(eq.taxonomy_id) if eq.taxonomy_id else None,
+            "taxonomy_name": tax.name if tax else "Planta General",
+            "stage": _resolver_etapa_pid(eq),
+            "criticality_level": crit.criticality_level if crit else None,
+            "rpn_score": crit.rpn_score if crit else None,
+            "has_telemetry": has_telemetry,
+            "latest_metric": latest_metric_payload,
+            "recent_series": recent_series,
+            "ml_prediction": resultado_ml,
+            "health_score": health_score,
+            "status": node_status,
+            "anomalies": anomalias,
+            "active_work_orders_count": active_wo_count_map.get(eq.id, 0),
+            "latest_recommendation": (
+                {
+                    "id": str(ultima_rec.id),
+                    "prediction_type": ultima_rec.prediction_type,
+                    "confidence_score": float(ultima_rec.confidence_score),
+                    "status": ultima_rec.status,
+                    "recommendation_text": ultima_rec.recommendation_text,
+                    "created_at": ultima_rec.created_at.isoformat() if ultima_rec.created_at else None,
+                }
+                if ultima_rec
+                else None
+            ),
+            "technical_specifications": eq.technical_specifications or {},
+        })
+
+    avg_health = round(sum(n["health_score"] for n in nodos) / len(nodos), 1) if nodos else 100.0
+    critical_nodes = sum(1 for n in nodos if n["status"] == "critical")
+    warning_nodes = sum(1 for n in nodos if n["status"] == "warning")
+    normal_nodes = sum(1 for n in nodos if n["status"] == "normal")
+    with_telemetry = sum(1 for n in nodos if n["has_telemetry"])
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "total_nodes": len(nodos),
+        "summary": {
+            "average_health_score": avg_health,
+            "normal_count": normal_nodes,
+            "warning_count": warning_nodes,
+            "critical_count": critical_nodes,
+            "with_telemetry_count": with_telemetry,
+            "without_telemetry_count": len(nodos) - with_telemetry,
+        },
+        "taxonomies": [
+            {
+                "id": str(t.id),
+                "name": t.name,
+                "level": t.level,
+                "parent_id": str(t.parent_id) if t.parent_id else None,
+            }
+            for t in taxonomies_rows
+        ],
+        "nodes": nodos,
     }

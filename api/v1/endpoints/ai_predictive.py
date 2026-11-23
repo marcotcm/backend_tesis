@@ -1,5 +1,6 @@
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, Field
 
@@ -13,7 +14,8 @@ from services.ai_predictive_service import (
     generar_plan_mantenimiento_ia,
     generar_plan_mantenimiento_fallback,
     evaluar_riesgo_global_planta,
-    generar_planes_mantenimiento_globales
+    generar_planes_mantenimiento_globales,
+    obtener_estado_gemelo_digital,
 )
 
 router = APIRouter()
@@ -227,6 +229,24 @@ async def generar_plan_contingencia(
 # =====================================================================
 # RUTAS GLOBALES (NIVEL PLANTA)
 # =====================================================================
+
+@router.get(
+    "/gemelo-digital",
+    status_code=status.HTTP_200_OK,
+    summary="Estado en tiempo real del Gemelo Digital (Telemetría + XGBoost + Topología)",
+    description="Devuelve todos los activos reales activos con su última telemetría, deltas, predicción XGBoost, criticidad, órdenes activas y etapa topológica P&ID."
+)
+async def consultar_gemelo_digital(
+    taxonomy_id: Optional[uuid.UUID] = Query(None, description="Filtrar por categoría de taxonomía"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    resultado = await obtener_estado_gemelo_digital(db=db, taxonomy_id=taxonomy_id)
+    return {
+        "mensaje": "Estado del Gemelo Digital sincronizado en tiempo real.",
+        "resultado": resultado
+    }
+
 
 @router.get(
     "/riesgo-planta",
