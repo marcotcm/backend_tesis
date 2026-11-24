@@ -42,8 +42,21 @@ class RecentActivity(BaseModel):
     equipment_tag: str
 
 
+class MroCostStats(BaseModel):
+    total_skus: int = 0
+    low_stock_count: int = 0
+    out_of_stock_count: int = 0
+    total_inventory_value: float = 0.0
+    month_labor_cost: float = 0.0
+    month_parts_cost: float = 0.0
+    month_total_maintenance_cost: float = 0.0
+    month_downtime_hours: float = 0.0
+    month_downtime_cost: float = 0.0
+
+
 class DashboardSummary(BaseModel):
     equipment_stats: EquipmentStats
     work_order_stats: WorkOrderStats
     failure_stats: FailureStats
+    mro_stats: Optional[MroCostStats] = None
     recent_activity: list[RecentActivity]

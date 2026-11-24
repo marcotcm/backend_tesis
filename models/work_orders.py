@@ -9,7 +9,7 @@ correctivo, etc.), gestionando la asignación de técnicos, estados y prioridade
 import enum
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Column, String, Text, ForeignKey, DateTime
+from sqlalchemy import Column, String, Text, ForeignKey, DateTime, Numeric
 from sqlalchemy.dialects.postgresql import UUID
 from db.session import Base
 
@@ -45,6 +45,13 @@ class WorkOrder(Base):
     completed_at = Column(DateTime(timezone=True), nullable=True)
     
     technician_notes = Column(Text, nullable=True)
+
+    # Costos operacionales y tiempo de paro (Fase 1 Enterprise MRO)
+    labor_hours = Column(Numeric(10, 2), nullable=True, default=0)
+    labor_cost = Column(Numeric(12, 2), nullable=True, default=0)
+    parts_cost = Column(Numeric(12, 2), nullable=True, default=0)
+    downtime_hours = Column(Numeric(10, 2), nullable=True, default=0)
+    estimated_downtime_cost = Column(Numeric(12, 2), nullable=True, default=0)
     
     # Trazabilidad
     created_by = Column(UUID(as_uuid=True), ForeignKey("public.users.id", ondelete="RESTRICT"), nullable=False)

@@ -15,7 +15,9 @@ from core.security import get_current_user, RoleChecker
 from models.user import User, UserRole
 from models.work_orders import WorkOrderStatus
 from schemas.work_orders import WorkOrderCreate, WorkOrderUpdate, WorkOrderResponse
+from schemas.spare_part import WorkOrderPartConsumeRequest, WorkOrderPartResponse
 from services import work_orders as wo_service
+from services import spare_parts as sp_service
 
 router = APIRouter()
 
@@ -163,3 +165,34 @@ async def anular_orden(
     * **Resultado:** Mantiene intacta la trazabilidad y la integridad referencial, bloqueando la cancelación si la orden ya figura como Terminada.
     """
     return await wo_service.cancel_work_order(db=db, wo_id=id, current_user=current_user)
+
+
+@router.get("/{wo_id}/repuestos", response_model=List[WorkOrderPartResponse], status_code=status.HTTP_200_OK)
+async def listar_repuestos_de_orden(
+    wo_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await sp_service.list_work_order_parts(db=db, wo_id=wo_id)
+
+
+@router.post("/{wo_id}/repuestos", response_model=WorkOrderPartResponse, status_code=status.HTTP_201_CREATED)
+async def consumir_repuesto_en_orden(
+    wo_id: uuid.UUID,
+    req: WorkOrderPartConsumeRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await sp_service.consume_spare_part_for_work_order(
+        db=db, wo_id=wo_id, req=req, current_user=current_user
+    )
+
+
+@router.delete("/{wo_id}/repuestos/{usage_id}", status_code=status.HTTP_200_OK)
+async def revertir_repuesto_de_orden(
+    wo_id: uuid.UUID,
+    usage_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await sp_service.remove_work_order_part(db=db, wo_id=wo_id, usage_id=usage_id)

@@ -10,6 +10,7 @@ from models.equipment_criticality import EquipmentCriticality
 from models.failure_history import FailureHistory
 from models.maintenance import Maintenance
 from models.maintenance_history import MaintenanceHistory
+from models.spare_part import SparePart
 from models.work_orders import WorkOrder, WorkOrderStatus
 
 
@@ -172,6 +173,67 @@ async def get_failure_stats(db: AsyncSession) -> dict[str, Any]:
         "mttr_hours": mttr_hours,
         "inherent_availability_pct": inherent_availability_pct,
     }
+
+
+async def get_mro_cost_stats(
+    db: AsyncSession,
+    month_start: datetime,
+    next_month_start: datetime,
+) -> dict[str, Any]:
+    """Estadísticas MRO y costos mensuales (tolerante a tabla aún no migrada)."""
+    default_stats = {
+        "total_skus": 0,
+        "low_stock_count": 0,
+        "out_of_stock_count": 0,
+        "total_inventory_value": 0.0,
+        "month_labor_cost": 0.0,
+        "month_parts_cost": 0.0,
+        "month_total_maintenance_cost": 0.0,
+        "month_downtime_hours": 0.0,
+        "month_downtime_cost": 0.0,
+    }
+    try:
+        sp_res = await db.execute(
+            select(
+                func.count(SparePart.id).label("total_skus"),
+                func.count(case((SparePart.stock_qty <= SparePart.min_stock_qty, 1))).label("low_stock_count"),
+                func.count(case((SparePart.stock_qty <= 0, 1))).label("out_of_stock_count"),
+                func.coalesce(func.sum(SparePart.stock_qty * SparePart.unit_cost), 0.0).label("total_inventory_value"),
+            ).where(SparePart.is_active.is_(True))
+        )
+        sp_row = sp_res.mappings().one()
+
+        wo_ts = func.coalesce(WorkOrder.completed_at, WorkOrder.created_at)
+        wo_res = await db.execute(
+            select(
+                func.coalesce(func.sum(WorkOrder.labor_cost), 0.0).label("month_labor_cost"),
+                func.coalesce(func.sum(WorkOrder.parts_cost), 0.0).label("month_parts_cost"),
+                func.coalesce(func.sum(WorkOrder.downtime_hours), 0.0).label("month_downtime_hours"),
+                func.coalesce(func.sum(WorkOrder.estimated_downtime_cost), 0.0).label("month_downtime_cost"),
+            ).where(
+                WorkOrder.status != WorkOrderStatus.cancelado,
+                wo_ts >= month_start,
+                wo_ts < next_month_start,
+            )
+        )
+        wo_row = wo_res.mappings().one()
+
+        labor_cost = round(float(wo_row["month_labor_cost"] or 0.0), 2)
+        parts_cost = round(float(wo_row["month_parts_cost"] or 0.0), 2)
+        return {
+            "total_skus": int(sp_row["total_skus"] or 0),
+            "low_stock_count": int(sp_row["low_stock_count"] or 0),
+            "out_of_stock_count": int(sp_row["out_of_stock_count"] or 0),
+            "total_inventory_value": round(float(sp_row["total_inventory_value"] or 0.0), 2),
+            "month_labor_cost": labor_cost,
+            "month_parts_cost": parts_cost,
+            "month_total_maintenance_cost": round(labor_cost + parts_cost, 2),
+            "month_downtime_hours": round(float(wo_row["month_downtime_hours"] or 0.0), 2),
+            "month_downtime_cost": round(float(wo_row["month_downtime_cost"] or 0.0), 2),
+        }
+    except Exception:
+        await db.rollback()
+        return default_stats
 
 
 async def get_recent_activity(

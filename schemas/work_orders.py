@@ -8,7 +8,7 @@ la correcta estructura de datos antes de impactar el planificador.
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, model_validator
 from models.work_orders import WorkOrderStatus, WorkOrderPriority
 
 class WorkOrderBase(BaseModel):
@@ -21,6 +21,11 @@ class WorkOrderBase(BaseModel):
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     technician_notes: Optional[str] = None
+    labor_hours: Optional[float] = Field(default=0.0, ge=0)
+    labor_cost: Optional[float] = Field(default=0.0, ge=0)
+    parts_cost: Optional[float] = Field(default=0.0, ge=0)
+    downtime_hours: Optional[float] = Field(default=0.0, ge=0)
+    estimated_downtime_cost: Optional[float] = Field(default=0.0, ge=0)
 
     @model_validator(mode='after')
     def validate_execution_dates(self) -> 'WorkOrderBase':
@@ -49,6 +54,11 @@ class WorkOrderUpdate(BaseModel):
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     technician_notes: Optional[str] = None
+    labor_hours: Optional[float] = Field(default=None, ge=0)
+    labor_cost: Optional[float] = Field(default=None, ge=0)
+    parts_cost: Optional[float] = Field(default=None, ge=0)
+    downtime_hours: Optional[float] = Field(default=None, ge=0)
+    estimated_downtime_cost: Optional[float] = Field(default=None, ge=0)
 
     @model_validator(mode='after')
     def validate_dates_on_update(self) -> 'WorkOrderUpdate':

@@ -22,5 +22,6 @@ async def get_summary(db: AsyncSession, activity_limit: int = 10) -> dict:
             next_month_start,
         ),
         "failure_stats": await crud.get_failure_stats(db),
+        "mro_stats": await crud.get_mro_cost_stats(db, month_start, next_month_start),
         "recent_activity": await crud.get_recent_activity(db, activity_limit),
     }

@@ -7,7 +7,7 @@ Agrupa todos los sub-enrutadores modulares de la aplicación para ser montados e
 from fastapi import APIRouter
 from api.v1.endpoints import (
     equipment, equipment_metrics, equipment_taxonomy, maintenance, user, user_push_tokens, failure_history, work_orders, maintenance_history,
-    equipment_criticality, fmea_analysis, ai_recommendation, ai_correction, dashboard, ai_predictive, notifications, chatbot, twin_ws
+    equipment_criticality, fmea_analysis, ai_recommendation, ai_correction, dashboard, ai_predictive, notifications, chatbot, twin_ws, spare_parts
 )
 
 api_router = APIRouter()
@@ -28,6 +28,7 @@ api_router.include_router(maintenance.router, prefix="/mantenimientos", tags=["M
 api_router.include_router(equipment_metrics.router, prefix="/metricas", tags=["Métricas de Equipos"])
 api_router.include_router(failure_history.router, prefix="/fallas", tags=["Historial de Fallas"])
 api_router.include_router(work_orders.router, prefix="/ordenes", tags=["Órdenes de Trabajo"])
+api_router.include_router(spare_parts.router, prefix="/repuestos", tags=["Almacén MRO y Repuestos"])
 api_router.include_router(maintenance_history.router, prefix="/historial-mantenimientos", tags=["Historial de Mantenimientos"])
 api_router.include_router(equipment_criticality.router, prefix="/criticidad", tags=["Criticidad de Equipos"])
 api_router.include_router(fmea_analysis.router, prefix="/fmea", tags=["FMEA"])
