@@ -19,6 +19,11 @@ from models.equipment_metrics import EquipmentMetricHistory
 from models.user import User, UserRole
 from schemas.equipment_metrics import EquipmentMetricCreate, EquipmentMetricUpdate
 from services.ai_predictive_service import ejecutar_analisis_predictivo_background
+from services.industrial_alarms import (
+    evaluate_metric_alarms_isa18,
+    extract_pressure_psi,
+    upsert_hourly_metric_rollup,
+)
 from services.notification import trigger_global_alert
 from services.realtime_twin_hub import twin_hub
 
@@ -116,6 +121,46 @@ async def record_metric(
                 trigger_reference_id=nueva_metrica.id,
             )
 
+        # Fase 2 Enterprise: Evaluación ISA-18.2 y rollup time-series horario (tolerante a tabla no migrada)
+        alarm_triggered_evts: List[dict] = []
+        alarm_cleared_evts: List[dict] = []
+        try:
+            async with db.begin_nested():
+                trig, clrd = await evaluate_metric_alarms_isa18(
+                    db=db,
+                    equipment=equipment,
+                    temperature_celsius=float(metric_in.temperature_celsius)
+                    if metric_in.temperature_celsius is not None
+                    else None,
+                    vibration_mm_s=float(metric_in.vibration_mm_s)
+                    if metric_in.vibration_mm_s is not None
+                    else None,
+                    specific_metrics=metric_in.specific_metrics,
+                )
+                alarm_triggered_evts.extend(trig)
+                alarm_cleared_evts.extend(clrd)
+                await upsert_hourly_metric_rollup(
+                    db=db,
+                    equipment_id=metric_in.equipment_id,
+                    recorded_at=nueva_metrica.recorded_at,
+                    temperature_celsius=float(metric_in.temperature_celsius)
+                    if metric_in.temperature_celsius is not None
+                    else None,
+                    vibration_mm_s=float(metric_in.vibration_mm_s)
+                    if metric_in.vibration_mm_s is not None
+                    else None,
+                    pressure_psi=extract_pressure_psi(metric_in.specific_metrics),
+                )
+            await db.commit()
+        except Exception as phase2_err:
+            print(f"[WARN PHASE2 METRIC HOOK] {phase2_err}")
+
+        tax_str = str(equipment.taxonomy_id) if equipment and equipment.taxonomy_id else None
+        for evt in alarm_triggered_evts:
+            await twin_hub.broadcast_event("alarm_triggered", evt, taxonomy_id=tax_str)
+        for evt in alarm_cleared_evts:
+            await twin_hub.broadcast_event("alarm_cleared", evt, taxonomy_id=tax_str)
+
         await twin_hub.broadcast_event(
             "metric_ingested",
             {
@@ -123,7 +168,7 @@ async def record_metric(
                 "tag_number": equipment.tag_number if equipment else None,
                 "metric_id": str(nueva_metrica.id),
             },
-            taxonomy_id=str(equipment.taxonomy_id) if equipment and equipment.taxonomy_id else None,
+            taxonomy_id=tax_str,
         )
 
         return nueva_metrica
@@ -226,6 +271,43 @@ async def ingest_iot_batch(
                 trigger_source=f"IoT Gateway ({source})",
                 trigger_reference_id=metric_obj.id,
             )
+
+    batch_triggered: List[tuple[Optional[str], dict]] = []
+    batch_cleared: List[tuple[Optional[str], dict]] = []
+    try:
+        async with db.begin_nested():
+            for eq, metric_obj in zip(matched_eqs, created_objs):
+                temp_v = float(metric_obj.temperature_celsius) if metric_obj.temperature_celsius is not None else None
+                vib_v = float(metric_obj.vibration_mm_s) if metric_obj.vibration_mm_s is not None else None
+                trig, clrd = await evaluate_metric_alarms_isa18(
+                    db=db,
+                    equipment=eq,
+                    temperature_celsius=temp_v,
+                    vibration_mm_s=vib_v,
+                    specific_metrics=metric_obj.specific_metrics,
+                )
+                tax_str = str(eq.taxonomy_id) if eq.taxonomy_id else None
+                for evt in trig:
+                    batch_triggered.append((tax_str, evt))
+                for evt in clrd:
+                    batch_cleared.append((tax_str, evt))
+
+                await upsert_hourly_metric_rollup(
+                    db=db,
+                    equipment_id=eq.id,
+                    recorded_at=metric_obj.recorded_at,
+                    temperature_celsius=temp_v,
+                    vibration_mm_s=vib_v,
+                    pressure_psi=extract_pressure_psi(metric_obj.specific_metrics),
+                )
+        await db.commit()
+    except Exception as phase2_batch_err:
+        print(f"[WARN PHASE2 IOT HOOK] {phase2_batch_err}")
+
+    for tax_str, evt in batch_triggered:
+        await twin_hub.broadcast_event("alarm_triggered", evt, taxonomy_id=tax_str)
+    for tax_str, evt in batch_cleared:
+        await twin_hub.broadcast_event("alarm_cleared", evt, taxonomy_id=tax_str)
 
     tags_updated = list({eq.tag_number for eq in matched_eqs})
     equipment_ids = list({str(eq.id) for eq in matched_eqs})

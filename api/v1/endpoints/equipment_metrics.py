@@ -6,7 +6,7 @@ gestionando la interacción con la base de datos local para la telemetría de eq
 """
 
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from datetime import datetime
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -20,7 +20,9 @@ from crud.user import get_user_by_id
 from db.session import get_db
 from models.user import User, UserRole
 from schemas.equipment_metrics import EquipmentMetricCreate, EquipmentMetricUpdate, EquipmentMetricResponse
+from schemas.industrial_alarm import MetricTimeSeriesPoint
 from services import equipment_metrics as metrics_service
+from services import industrial_alarms as alarm_service
 
 router = APIRouter()
 optional_bearer = HTTPBearer(auto_error=False)
@@ -153,6 +155,16 @@ async def listar_metricas_globales(
     * **Resultado:** Retorna un arreglo JSON ordenado cronológicamente con el historial de variables operativas.
     """
     return await metrics_service.get_all_metrics(db=db, skip=skip, limit=limit)
+
+@router.get("/equipo/{equipment_id}/serie-temporal", response_model=List[MetricTimeSeriesPoint], status_code=status.HTTP_200_OK)
+async def serie_temporal_horaria_equipo(
+    equipment_id: uuid.UUID,
+    range: Literal["24h", "7d", "30d"] = Query("24h", description="Horizonte temporal: 24h, 7d o 30d"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await alarm_service.get_equipment_timeseries(db=db, equipment_id=equipment_id, range_key=range)
+
 
 @router.get("/equipo/{equipment_id}", response_model=List[EquipmentMetricResponse], status_code=status.HTTP_200_OK)
 async def historial_por_equipo(
